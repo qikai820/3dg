@@ -357,6 +357,8 @@ void MissionController::receive(const mission::Envelope &e) {
     if (u.scheme() == "rtsp" || u.scheme() == "http" || u.scheme() == "https") {
       videoUrl_ = u.toString();
       videoState_->setText("已收到视频地址，点击播放");
+      log(u.path() == "/mission3dg" ? "已收到 Odin1 去畸变视频地址"
+                                      : "已收到视频地址", "视频");
     }
     if (!e.video().running())
       player_->stop();
