@@ -1,5 +1,6 @@
 #include "ProtocolClient.h"
 #include <QDateTime>
+#include <QNetworkProxy>
 #include <QUuid>
 #include <cmath>
 
@@ -11,6 +12,12 @@ static bool finiteVec(const mission::Vec3 &p) {
 ProtocolClient::ProtocolClient(QObject *parent)
     : QObject(parent),
       localSession_(QUuid::createUuid().toString(QUuid::WithoutBraces)) {
+  // The task-machine agent is a direct LAN peer; desktop HTTP proxies cannot
+  // carry these WebSocket channels and may change the source address.
+  const QNetworkProxy direct(QNetworkProxy::NoProxy);
+  control_.setProxy(direct);
+  cloud_.setProxy(direct);
+  files_.setProxy(direct);
   auto wire = [this](QWebSocket &socket, int channel) {
     connect(&socket, &QWebSocket::binaryMessageReceived, this,
             [this, channel](const QByteArray &b) {
