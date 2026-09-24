@@ -1,0 +1,89 @@
+syntax = "proto3";
+package mission;
+
+// All distances are metres, angles radians, timestamps Unix nanoseconds unless
+// time_domain explicitly identifies a device clock. One Envelope per WS message.
+message Vec3 { double x = 1; double y = 2; double z = 3; }
+message Quaternion { double x = 1; double y = 2; double z = 3; double w = 4; }
+message Hello { string name = 1; repeated string capabilities = 2; }
+message Heartbeat { uint64 uptime_ms = 1; }
+message VehicleState {
+  string frame_id = 1; string map_id = 2; Vec3 position = 3;
+  Quaternion orientation = 4; Vec3 velocity = 5;
+  bool pose_valid = 6; bool velocity_valid = 7;
+  bool battery_valid = 8; double battery_percent = 9;
+}
+message CompanionStatus {
+  string odin = 1; string ego = 2; string localization = 3;
+  bool video_running = 4; bool recording = 5;
+  double cloud_hz = 6; double network_mbps = 7;
+  double cpu_percent = 8; double disk_free_gb = 9;
+}
+message CloudFrame {
+  enum Layout { XYZ_RGB_LE16 = 0; }
+  string frame_id = 1; string map_id = 2; uint32 point_count = 3;
+  Layout layout = 4; bytes point_data = 5; bool snapshot = 6;
+  // Each point: float32 LE x,y,z, uint8 r,g,b,reserved. No compression in v1.
+}
+message TrajectoryPoint { Vec3 position = 1; double time_from_start_s = 2; }
+// Complete local occupancy snapshot, independent of the displayed sensor cloud.
+// Empty centers clears the grid. Centers and resolution are in metres.
+message VoxelGrid {
+  string frame_id = 1; string map_id = 2; double resolution_m = 3;
+  repeated Vec3 centers = 4; bool inflated = 5;
+}
+message PlannerTrajectory {
+  enum State { VALID = 0; FAILED = 1; CANCELLED = 2; }
+  string trajectory_id = 1; string frame_id = 2; string map_id = 3;
+  uint64 start_time_ns = 4; repeated TrajectoryPoint points = 5;
+  State state = 6; string detail = 7;
+}
+message Waypoint { Vec3 position = 1; double yaw = 2; double speed = 3; double hold_s = 4; }
+message MissionPlan {
+  string mission_id = 1; string map_id = 2; string frame_id = 3;
+  uint32 revision = 4; repeated Waypoint waypoints = 5;
+}
+message Command {
+  enum Kind { UNSPECIFIED = 0; START_ODIN = 1; START_EGO = 2; END_MISSION = 3;
+    VIDEO_START = 4; VIDEO_STOP = 5; RECORD_START = 6; RECORD_STOP = 7;
+    SAVE_MAP = 8; GET_CONFIG = 9; SET_CONFIG = 10; UPLOAD_MISSION = 11; GET_FILE = 12;
+    GET_YAML_CATALOG = 13; GET_YAML_DOCUMENT = 14; PATCH_YAML_DOCUMENT = 15; }
+  Kind kind = 1; Config config = 2; MissionPlan mission = 3; string file_id = 4;
+  string yaml_document_id = 5; string yaml_revision = 6; string yaml_patch_json = 7;
+}
+message CommandResult {
+  enum State { ACCEPTED = 0; SUCCEEDED = 1; FAILED = 2; }
+  State state = 1; string detail = 2;
+}
+message Config { double cloud_hz = 1; double voxel_m = 2; string frame_id = 3;
+  string map_id = 4; double clearance_m = 5; }
+message YamlFile { string id = 1; string label = 2; string usage = 3; }
+message YamlCatalog { repeated YamlFile files = 1; }
+// JSON preserves the YAML map/list hierarchy; revision is SHA-256 of the file bytes.
+// metadata_json describes selected labels, ranges and restart requirements.
+message YamlDocument {
+  string id = 1; string label = 2; string revision = 3;
+  string content_json = 4; string metadata_json = 5; string usage = 6;
+}
+message LogEntry {
+  enum Level { INFO = 0; WARNING = 1; ERROR = 2; }
+  string source = 1; Level level = 2; string text = 3;
+}
+message VideoStreamInfo { string url = 1; string codec = 2; bool running = 3; }
+message FileChunk {
+  string file_id = 1; string name = 2; uint64 total_size = 3;
+  uint64 offset = 4; bytes data = 5; bool last = 6; bytes sha256 = 7;
+}
+message Envelope {
+  uint32 protocol_version = 1; string session_id = 2; uint64 sequence = 3;
+  string request_id = 4; uint64 timestamp_ns = 5; string time_domain = 6;
+  oneof payload {
+    Hello hello = 10; Heartbeat heartbeat = 11; VehicleState vehicle = 12;
+    CompanionStatus status = 13; CloudFrame cloud = 14;
+    PlannerTrajectory trajectory = 15; Command command = 16;
+    CommandResult result = 17; Config config = 18; LogEntry log = 19;
+    VideoStreamInfo video = 20; FileChunk file = 21;
+    VoxelGrid grid = 22;
+    YamlCatalog yaml_catalog = 23; YamlDocument yaml_document = 24;
+  }
+}

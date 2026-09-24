@@ -16,6 +16,10 @@
 //##########################################################################
 
 #include <ccIncludeGL.h>
+#ifdef THREEDG_ENABLED
+#include "mission3dg/MissionController.h"
+#include <memory>
+#endif
 
 //Qt
 #include <QDir>
@@ -163,6 +167,10 @@ int main(int argc, char **argv)
     ccApplication::InitOpenGL();
 
 	ccApplication app(argc, argv, commandLine);
+#ifdef THREEDG_ENABLED
+    if (!commandLine && qEnvironmentVariableIsSet("THREEDG"))
+        QCoreApplication::setApplicationName("3DG");
+#endif
 
 #ifdef CC_GAMEPAD_SUPPORT
 #if QT_VERSION >= QT_VERSION_CHECK(5, 9, 0)
@@ -307,6 +315,11 @@ int main(int argc, char **argv)
 		QDir::setCurrent(workingDir.absolutePath());
 
 		//let's rock!
+#ifdef THREEDG_ENABLED
+        std::unique_ptr<MissionController> missionController;
+        if (qEnvironmentVariableIsSet("THREEDG"))
+            missionController.reset(new MissionController(mainWindow));
+#endif
 		try
 		{
 			result = QApplication::exec();
