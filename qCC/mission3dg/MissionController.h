@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QPointer>
 #include <QSaveFile>
+#include <QSize>
 #include <QVector3D>
 #include <ccPickingListener.h>
 #include <memory>
@@ -89,7 +90,7 @@ private:
          *mapPopover_ = nullptr;
   QWidget *routeDetails_ = nullptr, *routeStrip_ = nullptr;
   QLabel *hud_ = nullptr, *status_ = nullptr, *mode_ = nullptr,
-         *videoState_ = nullptr, *logCount_ = nullptr, *mapInfo_ = nullptr,
+         *logCount_ = nullptr, *mapInfo_ = nullptr,
          *mapBadge_ = nullptr, *protocolHint_ = nullptr,
          *routeSummary_ = nullptr;
   QProgressBar *batteryBar_ = nullptr;
@@ -122,11 +123,14 @@ private:
   double voxel_ = 0.15, clearance_ = 1.0, cloudHz_ = 10;
   bool demo_ = false, dirty_ = false, ready_ = false, mapDirty_ = false;
   bool editorCollapsed_ = true;
-  bool videoBeforeExpanded_ = true;
   int demoStep_ = 0, unread_ = 0, drawStep_ = 0;
   quint64 demoSequence_ = 0;
   QPoint videoDrag_;
+  QPoint videoResizeMouse_;
+  QPoint videoResizeBottomLeft_;
+  QSize videoResizeStart_;
   bool dragging_ = false;
+  bool resizingVideo_ = false;
   bool videoPlaced_ = false;
   QFile logFile_;
   std::unique_ptr<QSaveFile> download_;

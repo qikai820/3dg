@@ -207,6 +207,7 @@ void MissionController::settings() {
   }
   bool changed =
       frame_ != frame.text() || mapId_ != map.text() || voxel_ != voxel.value();
+  const bool videoChanged = videoUrl_ != video.text();
   setDemo(false);
   baseUrl_ = address.text();
   frame_ = frame.text();
@@ -222,6 +223,13 @@ void MissionController::settings() {
     mission_.clear_waypoints();
     rebuildRoute();
     mapDirty_ = dirty_ = true;
+  }
+  if (videoChanged) {
+    if (videoUrl_.trimmed().isEmpty()) {
+      player_->stop();
+      video_->hide();
+    } else
+      showVideo();
   }
   refreshMapInfo();
   QSettings s("3DG", "Mission");
@@ -354,14 +362,19 @@ void MissionController::receive(const mission::Envelope &e) {
       pendingKinds_.remove(QString::fromStdString(e.request_id()));
   } else if (e.has_video()) {
     const QUrl u(QString::fromStdString(e.video().url()));
-    if (u.scheme() == "rtsp" || u.scheme() == "http" || u.scheme() == "https") {
-      videoUrl_ = u.toString();
-      videoState_->setText("已收到视频地址，点击播放");
-      log(u.path() == "/mission3dg" ? "已收到 Odin1 去畸变视频地址"
-                                      : "已收到视频地址", "视频");
-    }
-    if (!e.video().running())
+    if (!e.video().running()) {
       player_->stop();
+      video_->hide();
+    } else if (u.scheme() == "rtsp" || u.scheme() == "http" ||
+               u.scheme() == "https") {
+      const bool addressChanged = videoUrl_ != u.toString();
+      videoUrl_ = u.toString();
+      if (addressChanged)
+        log(u.path() == "/mission3dg" ? "已收到 Odin1 去畸变视频地址"
+                                        : "已收到视频地址", "视频");
+      showVideo();
+    } else
+      log("收到无效的视频地址", "视频");
   } else if (e.has_file())
     fileChunk(e);
 }
@@ -661,12 +674,15 @@ void MissionController::saveMap() {
 void MissionController::showVideo() {
   video_->show();
   video_->raise();
-  if (videoUrl_.isEmpty()) {
-    videoState_->setText("请设置视频地址后点击播放");
+  if (videoUrl_.trimmed().isEmpty()) {
+    log("请先在 3DG 配置中设置视频地址，或启动机载视频", "视频");
     return;
   }
-  player_->setMedia(QUrl::fromUserInput(videoUrl_));
-  player_->play();
+  const QUrl url = QUrl::fromUserInput(videoUrl_.trimmed());
+  if (player_->currentMedia().canonicalUrl() != url)
+    player_->setMedia(url);
+  if (player_->state() != QMediaPlayer::PlayingState)
+    player_->play();
 }
 void MissionController::requestFile() {
   if (!client_.ready()) {
@@ -738,6 +754,22 @@ void MissionController::smoke() {
   demoTimer_.stop();
   updateScene();
   window_->screen()->grabWindow(window_->winId()).save(p + "/3dg.png");
+  bool emptyVideoVisible = true;
+  if (videoUrl_.trimmed().isEmpty()) {
+    QAction *videoAction = nullptr;
+    for (auto *action : window_->menuBar()->findChildren<QAction *>()) {
+      if (action->text() == QStringLiteral("悬浮视频窗口")) {
+        videoAction = action;
+        break;
+      }
+    }
+    if (videoAction)
+      videoAction->trigger();
+    QApplication::processEvents();
+    emptyVideoVisible = videoAction && video_->isVisible();
+    video_->grab().save(p + "/video-empty.png");
+    video_->hide();
+  }
   const int gridCells = gridCenters_.size();
   auto *gridMesh = grid_->getChildrenNumber()
                        ? dynamic_cast<ccMesh *>(grid_->getChild(0)) : nullptr;
@@ -844,6 +876,7 @@ void MissionController::smoke() {
                                     {"pcd_load_file", loadPath},
                                     {"mission_read", missionRead},
                                     {"video_playing", videoOk},
+                                    {"video_empty_visible", emptyVideoVisible},
                                     {"points", pts.size()},
                                     {"trajectory_points", history_.size()},
                                     {"ego_points", egoPoints_.size()}})
@@ -852,6 +885,7 @@ void MissionController::smoke() {
   QApplication::exit(
       a && b && c && pcdLoaded && pcdVisible && missionRead &&
               gridGeometry && gridToggle && gridCleared && gridFrameGuard && gridExpired &&
+              emptyVideoVisible &&
               (!qEnvironmentVariableIsSet("THREEDG_SMOKE_VIDEO") || videoOk)
           ? 0
           : 1);

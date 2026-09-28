@@ -82,6 +82,11 @@ public:
           QPoint((width() - size.width()) / 2, (height() - size.height()) / 2),
           size);
       painter.drawImage(area, surface->image);
+    } else {
+      painter.setPen(QColor(220, 231, 236));
+      painter.drawText(rect().adjusted(12, 12, -12, -12),
+                       Qt::AlignCenter | Qt::TextWordWrap,
+                       QStringLiteral("暂无视频画面\n请在 3DG 配置中设置视频地址，或启动机载视频"));
     }
   }
 };
@@ -459,7 +464,7 @@ MissionController::MissionController(MainWindow *w)
                   "任务机网络　　离线\nOdin1　　　　　 —\nEGO- Planner　　 "
                   "—\n定位状态　　　　—\n视频 / 记录　　　—");
               player_->stop();
-              videoState_->setText("连接断开，视频已停止");
+              video_->hide();
               if (download_) {
                 download_.reset();
                 log("连接中断，未完成文件已取消");
@@ -515,7 +520,8 @@ MissionController::MissionController(MainWindow *w)
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_VIDEO")) {
     videoUrl_ = qEnvironmentVariable("THREEDG_SMOKE_VIDEO");
     showVideo();
-  }
+  } else if (!videoUrl_.isEmpty())
+    showVideo();
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_DIR"))
     QTimer::singleShot(4500, this, &MissionController::smoke);
 }
@@ -558,6 +564,7 @@ void MissionController::buildUi() {
       "border:1px solid rgba(255,255,255,220);border-radius:12px;}"
       "QFrame#missionToolbar{background:rgba(235,244,249,244);border-radius:"
       "10px;}"
+      "QFrame#videoOverlay{background:#081116;border:0;border-radius:0;}"
       "QLabel{color:#304756;background:transparent;}"
       "QLabel#cardTitle{font-size:13px;font-weight:650;color:#263d4c;}"
       "QLabel#sectionTitle{font-size:11px;font-weight:650;color:#657d8d;}"
@@ -973,55 +980,36 @@ void MissionController::buildUi() {
             [this, k = op.second] { command(k); });
     ++i;
   }
-  video_ = card(canvas_, "前视相机 · 拖动移动 / 右下角缩放");
-  video_->setMinimumSize(245, 175);
-  video_->resize(270, 205);
+  video_ = new QFrame(canvas_);
+  video_->setObjectName("videoOverlay");
+  auto *videoLayout = new QVBoxLayout(video_);
+  videoLayout->setContentsMargins(0, 0, 0, 0);
+  videoLayout->setSpacing(0);
+  video_->setMinimumSize(160, 90);
+  video_->resize(320, 180);
   video_->installEventFilter(this);
-  for (auto *label : video_->findChildren<QLabel *>()) {
-    label->installEventFilter(this);
-    label->setCursor(Qt::SizeAllCursor);
-  }
   videoWidget_ = new VideoCanvas(video_);
-  box(video_)->addWidget(videoWidget_, 1);
-  videoState_ = new QLabel("未配置视频源 · 可播放本地或 RTSP");
-  videoState_->setObjectName("mutedText");
-  box(video_)->addWidget(videoState_);
-  auto *vr = new QHBoxLayout;
-  box(video_)->addLayout(vr);
-  button(vr, "▶ 播放", [this] {
-    bool ok = false;
-    auto u = QInputDialog::getText(window_, "视频源",
-                                   "rtsp://、http(s):// 或本地文件路径",
-                                   QLineEdit::Normal, videoUrl_, &ok);
-    if (ok && !u.isEmpty()) {
-      videoUrl_ = u;
-      showVideo();
-    }
-  });
-  button(vr, "■ 停止", [this] {
-    player_->stop();
-    videoState_->setText("本地播放已停止");
-  });
-  button(vr, "收起", [this] { video_->hide(); });
-  auto *grip = new QSizeGrip(video_);
-  vr->addWidget(grip);
+  videoWidget_->setMouseTracking(true);
+  videoWidget_->setToolTip("拖动视频移动；拖动右上角等比例缩放");
+  videoWidget_->installEventFilter(this);
+  videoLayout->addWidget(videoWidget_);
   player_ = new QMediaPlayer(this);
   player_->setVideoOutput(videoWidget_->surface);
   connect(player_, QOverload<QMediaPlayer::Error>::of(&QMediaPlayer::error),
-          this, [this](QMediaPlayer::Error) {
-            videoState_->setText("播放错误：" + player_->errorString());
+          this, [this](QMediaPlayer::Error error) {
+            if (error == QMediaPlayer::NoError)
+              return;
             log(player_->errorString(), "视频");
+            videoWidget_->update();
           });
   connect(player_, &QMediaPlayer::mediaStatusChanged, this,
           [this](QMediaPlayer::MediaStatus s) {
             if (s == QMediaPlayer::StalledMedia)
-              videoState_->setText("视频缓冲中 / 流中断");
-            else if (s == QMediaPlayer::BufferedMedia)
-              videoState_->setText("视频播放中");
+              log("视频缓冲中或流中断", "视频");
             else if (s == QMediaPlayer::EndOfMedia)
-              videoState_->setText("视频已结束");
+              videoWidget_->update();
           });
-  video_->show();
+  video_->hide();
   left_->show();
   right_->show();
   top_->show();
@@ -1031,7 +1019,7 @@ void MissionController::buildUi() {
   protocolHint_ = new QLabel("Protobuf v1  ·  未连接", window_->statusBar());
   protocolHint_->setObjectName("mutedText");
   window_->statusBar()->addPermanentWidget(protocolHint_);
-  for (auto *cardWidget : {left_, mapPopover_, top_, editor_, video_, h, s, o}) {
+  for (auto *cardWidget : {left_, mapPopover_, top_, editor_, h, s, o}) {
     auto *shadow = new QGraphicsDropShadowEffect(cardWidget);
     shadow->setBlurRadius(22);
     shadow->setOffset(0, 4);
@@ -1101,15 +1089,6 @@ void MissionController::refreshRouteStrip() {
 void MissionController::setEditorCollapsed(bool collapsed) {
   if (!editor_ || !routeDetails_ || !routeStrip_)
     return;
-  if (editorCollapsed_ != collapsed && video_) {
-    if (collapsed) {
-      if (videoBeforeExpanded_)
-        video_->show();
-    } else {
-      videoBeforeExpanded_ = video_->isVisible();
-      video_->hide();
-    }
-  }
   editorCollapsed_ = collapsed;
   routeDetails_->setVisible(!collapsed);
   routeStrip_->setVisible(collapsed);
@@ -1147,6 +1126,10 @@ void MissionController::arrange() {
                       qMin(h - video_->height() - margin,
                            editorY - video_->height() - 10)));
   } else if (videoPlaced_) {
+    const int maxWidth = qMin(w, (h * 16) / 9);
+    const int width = qBound(video_->minimumWidth(), video_->width(),
+                             qMax(video_->minimumWidth(), maxWidth));
+    video_->resize(width, qRound(width * 9.0 / 16.0));
     video_->move(qBound(0, video_->x(), qMax(0, w - video_->width())),
                  qBound(0, video_->y(), qMax(0, h - video_->height())));
   }
@@ -1179,27 +1162,73 @@ bool MissionController::eventFilter(QObject *o, QEvent *e) {
     latest_->move(qMax(500, window_->menuBar()->width() - 360), 4);
     latest_->raise();
   }
-  if (o == video_ || qobject_cast<QLabel *>(o)) {
+  if (o == video_ || o == videoWidget_) {
+    QMouseEvent *m = nullptr;
+    if (e->type() == QEvent::MouseButtonPress ||
+        e->type() == QEvent::MouseButtonRelease ||
+        e->type() == QEvent::MouseMove)
+      m = static_cast<QMouseEvent *>(e);
+    const QPoint local = m ? video_->mapFromGlobal(m->globalPos()) : QPoint();
+    constexpr int resizeCorner = 18;
+    const bool atResizeCorner =
+        local.x() >= video_->width() - resizeCorner &&
+        local.x() < video_->width() && local.y() >= 0 &&
+        local.y() < resizeCorner;
     if (e->type() == QEvent::MouseButtonPress) {
-      auto *m = static_cast<QMouseEvent *>(e);
       if (m->button() == Qt::LeftButton) {
-        videoDrag_ = m->globalPos() - video_->pos();
-        dragging_ = true;
+        if (atResizeCorner) {
+          videoResizeMouse_ = m->globalPos();
+          videoResizeStart_ = video_->size();
+          videoResizeBottomLeft_ = video_->geometry().bottomLeft();
+          resizingVideo_ = true;
+        } else {
+          videoDrag_ = local;
+          dragging_ = true;
+        }
+        video_->raise();
         return true;
       }
     }
+    if (e->type() == QEvent::MouseMove && resizingVideo_) {
+      const QPoint delta = m->globalPos() - videoResizeMouse_;
+      // Project mouse movement onto the upper-right diagonal. The lower-left
+      // corner stays fixed while the window keeps its 16:9 aspect ratio.
+      constexpr double heightPerWidth = 9.0 / 16.0;
+      const double widthDelta =
+          (delta.x() - heightPerWidth * delta.y()) /
+          (1.0 + heightPerWidth * heightPerWidth);
+      const int maxWidth = qMax(
+          video_->minimumWidth(),
+          qMin(canvas_->width() - videoResizeBottomLeft_.x(),
+               (videoResizeBottomLeft_.y() + 1) * 16 / 9));
+      const int width = qBound(video_->minimumWidth(),
+                               qRound(videoResizeStart_.width() + widthDelta),
+                               maxWidth);
+      const int height = qRound(width * heightPerWidth);
+      video_->setGeometry(videoResizeBottomLeft_.x(),
+                          videoResizeBottomLeft_.y() - height + 1,
+                          width, height);
+      videoPlaced_ = true;
+      return true;
+    }
     if (e->type() == QEvent::MouseMove && dragging_) {
-      auto *m = static_cast<QMouseEvent *>(e);
-      QPoint p = m->globalPos() - videoDrag_;
+      QPoint p = canvas_->mapFromGlobal(m->globalPos() - videoDrag_);
       p.setX(qBound(0, p.x(), qMax(0, canvas_->width() - video_->width())));
       p.setY(qBound(0, p.y(), qMax(0, canvas_->height() - video_->height())));
       video_->move(p);
+      videoPlaced_ = true;
       return true;
     }
-    if (e->type() == QEvent::MouseButtonRelease) {
-      if (dragging_)
+    if (e->type() == QEvent::MouseMove) {
+      videoWidget_->setCursor(atResizeCorner ? Qt::SizeBDiagCursor
+                                              : Qt::SizeAllCursor);
+    }
+    if (e->type() == QEvent::MouseButtonRelease &&
+        m->button() == Qt::LeftButton) {
+      if (dragging_ || resizingVideo_)
         videoPlaced_ = true;
       dragging_ = false;
+      resizingVideo_ = false;
       return true;
     }
   }
