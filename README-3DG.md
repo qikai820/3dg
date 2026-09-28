@@ -2,6 +2,8 @@
 
 基于 CloudCompare v2.13.2 的 C++ / Qt 桌面实现，不是网页原型。原版程序仍可直接运行；设置 `THREEDG=1` 才切换到地面站界面。
 
+桌面界面把 **3DG Mission ▾** 放在菜单栏最左侧；下拉菜单切换“任务监控 / 点云处理 / 对比分析”。三维视图始终铺满内容区，工具以紧凑半透明卡片浮在上层。处理文件通过“文件 → 导入处理对象”进入独立对象列表；实时地图可用“创建当前地图快照”生成固定的处理对象。编辑、处理和分析菜单复用当前构建可用的 CloudCompare 原有工具，对比工作区可指定参考与待测对象。完整功能规划与未完成项目见 `docs/3dg-cloudcompare-ui-plan.md`。
+
 ## 启动
 
 在本目录执行：
@@ -53,9 +55,18 @@
 
 ## 构建依赖
 
-沿用原工程的 Qt5、CMake、Ninja、CloudCompare 子模块；新增 Qt5 WebSockets、Qt5 Multimedia/Widgets、Protobuf 编译器与开发库。当前机器新增依赖解包到 `.deps/root`，未通过 sudo 更改系统。启动脚本设置对应库和视频插件路径。
+沿用原工程的 Qt5、CMake、Ninja、CloudCompare 子模块；新增 Qt5 WebSockets、Qt5 Multimedia/Widgets、Protobuf 编译器与开发库。首次克隆后，在工程根目录执行（Ubuntu 24.04）：
 
-其他 Ubuntu 24.04 环境可安装 `libqt5websockets5-dev qtmultimedia5-dev libqt5multimedia5-plugins libprotobuf-dev protobuf-compiler` 后用 CMake 构建 `-DOPTION_3DG=ON`。不构建地面站则指定 `-DOPTION_3DG=OFF`。
+```bash
+git submodule update --init --recursive -- libs/qCC_db/extern/CCCoreLib
+sudo apt-get install build-essential cmake ninja-build libeigen3-dev \
+  qtbase5-dev libqt5opengl5-dev libqt5svg5-dev qttools5-dev qttools5-dev-tools \
+  libqt5websockets5-dev qtmultimedia5-dev libqt5multimedia5-plugins \
+  libprotobuf-dev protobuf-compiler
+./scripts/build-3dg.sh
+```
+
+构建脚本优先使用可选的 `.deps/root/usr` 本地依赖，其余依赖从系统查找；`.deps` 不随 Git 分发，新克隆无需创建该目录。脚本会清除旧版强制指定的 Protobuf 和 Multimedia 缓存路径，再重新查找依赖。若使用本地解包方式，需要同时提供开发包、`protoc` 和配套运行库；启动脚本设置对应库和视频插件路径。不构建地面站则使用 CMake 指定 `-DOPTION_3DG=OFF`。
 
 ### Windows x64 便携包
 

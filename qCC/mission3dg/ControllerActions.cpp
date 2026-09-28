@@ -1260,9 +1260,18 @@ void MissionController::fileChunk(const mission::Envelope &e) {
 void MissionController::smoke() {
   QString p = qEnvironmentVariable("THREEDG_SMOKE_DIR");
   QDir().mkpath(p);
+  const auto sizeParts = qEnvironmentVariable("THREEDG_SMOKE_SIZE").split('x');
+  if (sizeParts.size() == 2 && sizeParts[0].toInt() >= 850 &&
+      sizeParts[1].toInt() >= 650) {
+    window_->showNormal();
+    window_->setWindowState(Qt::WindowNoState);
+    window_->resize(sizeParts[0].toInt(), sizeParts[1].toInt());
+    QApplication::processEvents();
+  }
   demoTimer_.stop();
   updateScene();
   window_->screen()->grabWindow(window_->winId()).save(p + "/3dg.png");
+  window_->grab().save(p + "/window-widget.png");
   bool emptyVideoVisible = true;
   if (videoUrl_.trimmed().isEmpty()) {
     QAction *videoAction = nullptr;
@@ -1595,6 +1604,89 @@ void MissionController::smoke() {
                           loadedCloud->size() == unsigned(mapPoints_.size());
   QApplication::processEvents();
   window_->screen()->grabWindow(window_->winId()).save(p + "/pcd-loaded.png");
+  auto *workspaceMenu = window_->menuBar()->findChild<QMenu *>("missionWorkspaceMenu");
+  QAction *firstVisibleMenu = nullptr;
+  for (auto *action : window_->menuBar()->actions()) {
+    if (action->isVisible()) {
+      firstVisibleMenu = action;
+      break;
+    }
+  }
+  QStringList workspaceProblems;
+  auto checkWorkspace = [&workspaceProblems](const QString &stage, bool ok) {
+    if (!ok)
+      workspaceProblems.append(stage);
+  };
+  checkWorkspace("menu", workspaceMenu &&
+                             firstVisibleMenu == workspaceMenu->menuAction() &&
+                             workspaceMenu->actions().size() == 3 &&
+                             !window_->menuBar()->actions().contains(
+                                 workspaceActions_.value(static_cast<int>(Workspace::Monitor))));
+  if (workspaceMenu) {
+    workspaceMenu->popup(window_->menuBar()->mapToGlobal(
+        QPoint(8, window_->menuBar()->height())));
+    QApplication::processEvents();
+    checkWorkspace("dropdown", workspaceMenu->isVisible() &&
+                                   workspaceActions_.value(static_cast<int>(Workspace::Monitor))->isChecked());
+    workspaceMenu->grab().save(p + "/workspace-menu.png");
+    workspaceMenu->hide();
+  }
+  workspaceActions_[static_cast<int>(Workspace::Processing)]->trigger();
+  QApplication::processEvents();
+  checkWorkspace("processing", workspace_ == Workspace::Processing &&
+                                   objectsCard_->isVisible() &&
+                                   processingCard_->isVisible() &&
+                                   !right_->isVisible());
+  const unsigned dbCountBefore = window_->dbRootObject()->getChildrenNumber();
+  snapshotMap();
+  QApplication::processEvents();
+  checkWorkspace("snapshot", window_->dbRootObject()->getChildrenNumber() ==
+                                 dbCountBefore + 1);
+  QListWidgetItem *snapshotItem = nullptr;
+  for (int row = 0; row < processingObjects_->count(); ++row) {
+    auto *item = processingObjects_->item(row);
+    if (item->text().contains("地图快照"))
+      snapshotItem = item;
+  }
+  checkWorkspace("snapshot_list", snapshotItem != nullptr);
+  if (snapshotItem) {
+    processingObjects_->setCurrentItem(snapshotItem);
+    QApplication::processEvents();
+    auto *selected = window_->dbRootObject()->find(
+        snapshotItem->data(Qt::UserRole).toUInt());
+    checkWorkspace("selection", selected &&
+                                    !window_->getSelectedEntities().empty() &&
+                                    window_->getSelectedEntities().back() == selected);
+    const unsigned beforeClone = window_->dbRootObject()->getChildrenNumber();
+    runCloudCompareAction("actionClone");
+    QApplication::processEvents();
+    checkWorkspace("clone", window_->dbRootObject()->getChildrenNumber() ==
+                                beforeClone + 1);
+    refreshProcessingObjects();
+    checkWorkspace("clone_list", processingObjects_->count() >= 2);
+  }
+  window_->grab().save(p + "/processing.png");
+  workspaceActions_[static_cast<int>(Workspace::Comparison)]->trigger();
+  QApplication::processEvents();
+  const int comparisonSelectedCount = static_cast<int>(window_->getSelectedEntities().size());
+  const bool comparisonCardVisible = comparisonOnly_->isVisible() &&
+                                      !processingOnly_->isVisible();
+  const bool comparisonRolesDiffer = referenceObject_->currentData().toUInt() !=
+                                     targetObject_->currentData().toUInt();
+  checkWorkspace("comparison", workspace_ == Workspace::Comparison &&
+                                   objectsCard_->isVisible() &&
+                                   processingCard_->isVisible() &&
+                                   comparisonCardVisible &&
+                                   comparisonRolesDiffer &&
+                                   comparisonSelectedCount == 2);
+  processingCard_->grab().save(p + "/comparison-card.png");
+  window_->grab().save(p + "/comparison.png");
+  workspaceActions_[static_cast<int>(Workspace::Monitor)]->trigger();
+  QApplication::processEvents();
+  checkWorkspace("return_monitor", workspace_ == Workspace::Monitor &&
+                                       right_->isVisible() &&
+                                       !objectsCard_->isVisible());
+  const bool workspaceUi = workspaceProblems.isEmpty();
   bool missionRead = importMission(p + "/mission.3dg.json");
   bool videoOk = player_->state() == QMediaPlayer::PlayingState &&
                  player_->isVideoAvailable() && player_->position() > 0;
@@ -1634,6 +1726,13 @@ void MissionController::smoke() {
                                     {"pcd_loaded", pcdLoaded},
                                     {"pcd_loaded_points", mapPoints_.size()},
                                     {"pcd_scene_visible", pcdVisible},
+                                    {"workspace_ui", workspaceUi},
+                                    {"workspace_problems", workspaceProblems.join(",")},
+                                    {"window_size", QString("%1x%2").arg(window_->width()).arg(window_->height())},
+                                    {"canvas_size", QString("%1x%2").arg(canvas_->width()).arg(canvas_->height())},
+                                    {"comparison_selected_count", comparisonSelectedCount},
+                                    {"comparison_card_visible", comparisonCardVisible},
+                                    {"comparison_roles_differ", comparisonRolesDiffer},
                                     {"pcd_load_file", loadPath},
                                     {"mission_read", missionRead},
                                     {"video_playing", videoOk},
@@ -1644,7 +1743,7 @@ void MissionController::smoke() {
               .toJson());
   f.commit();
   QApplication::exit(
-      a && b && c && pcdLoaded && pcdVisible && missionRead && mediaControls &&
+      a && b && c && pcdLoaded && pcdVisible && workspaceUi && missionRead && mediaControls &&
               waypointDefaultsToAircraft && waypointRejectsInvalidPose &&
               waypointPopupCombined && waypointRemoteReadOnly &&
               aircraftGeometry && aircraftPose && aircraftInvalidHidden && aircraftRecovered &&

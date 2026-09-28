@@ -2,6 +2,7 @@
 #include "MissionController.h"
 #include "QuadrotorModel.h"
 #include "mainwindow.h"
+#include "ccDBRoot.h"
 #include <FileIOFilter.h>
 #include <QAbstractVideoSurface>
 #include <QJsonArray>
@@ -454,8 +455,13 @@ MissionController::MissionController(MainWindow *w)
     log("无法隔离旧对象树的选择连接；请不要点击实时对象");
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_SIZE")) {
     const auto parts = qEnvironmentVariable("THREEDG_SMOKE_SIZE").split('x');
-    if (parts.size() == 2 && parts[0].toInt() >= 850 && parts[1].toInt() >= 650)
-      window_->resize(parts[0].toInt(), parts[1].toInt());
+    if (parts.size() == 2 && parts[0].toInt() >= 850 && parts[1].toInt() >= 650) {
+      const QSize smokeSize(parts[0].toInt(), parts[1].toInt());
+      QTimer::singleShot(0, window_, [this, smokeSize] {
+        window_->showNormal();
+        window_->resize(smokeSize);
+      });
+    }
   }
   canvas_->installEventFilter(this);
   connect(&client_, &ProtocolClient::message, this,
@@ -609,9 +615,9 @@ void MissionController::buildUi() {
   const QString css =
       "QMainWindow{background:#173341;}"
       "QFrame#missionCard,QFrame#missionToolbar{background:rgba(242,248,251,"
-      "240);"
+      "216);"
       "border:1px solid rgba(255,255,255,220);border-radius:12px;}"
-      "QFrame#missionToolbar{background:rgba(235,244,249,244);border-radius:"
+      "QFrame#missionToolbar{background:rgba(235,244,249,220);border-radius:"
       "10px;}"
       "QFrame#videoOverlay{background:#081116;border:0;border-radius:0;}"
       "QLabel{color:#304756;background:transparent;}"
@@ -673,7 +679,6 @@ void MissionController::buildUi() {
       "}"
       "QMenuBar::item{padding:7px 9px;margin:3px 1px;border-radius:6px;}"
       "QMenuBar::item:selected{background:#d7e9ee;}"
-      "QMenuBar::item:disabled{color:#284451;font-weight:700;}"
       "QMenu{background:#f2f8fa;color:#304756;border:1px solid #c8d9e2;}"
       "QMenu::item:selected{background:#d5f1ea;}"
       "QStatusBar{background:rgba(236,246,250,246);color:#5a7180;"
@@ -688,30 +693,57 @@ void MissionController::buildUi() {
   auto *bar = window_->menuBar();
   for (auto *a : bar->actions())
     a->setVisible(false);
-  auto *brand = bar->addAction("3DG Mission");
-  brand->setEnabled(false);
-  auto *monitorNav = bar->addAction("任务监控");
-  connect(monitorNav, &QAction::triggered, this,
-          [this] { setEditorCollapsed(true); });
+  auto *missionMenu = bar->addMenu("3DG Mission ▾");
+  missionMenu->setObjectName("missionWorkspaceMenu");
+  auto *workspaceGroup = new QActionGroup(missionMenu);
+  workspaceGroup->setExclusive(true);
+  const QVector<QPair<QString, Workspace>> workspaces = {
+      {"任务监控", Workspace::Monitor}, {"点云处理", Workspace::Processing},
+      {"对比分析", Workspace::Comparison}};
+  for (const auto &entry : workspaces) {
+    auto *action = missionMenu->addAction(entry.first);
+    action->setCheckable(true);
+    action->setChecked(entry.second == Workspace::Monitor);
+    action->setActionGroup(workspaceGroup);
+    workspaceActions_[static_cast<int>(entry.second)] = action;
+    connect(action, &QAction::triggered, this,
+            [this, workspace = entry.second] { setWorkspace(workspace); });
+  }
+  auto *file = bar->addMenu("文件");
+  file->addAction("加载 PCD / PLY 地图", this, &MissionController::loadMap);
+  file->addAction("导入处理对象…", this, &MissionController::importProcessingFiles);
+  file->addAction("创建当前地图快照", this, &MissionController::snapshotMap);
+  file->addAction("保存点云 PCD", this, &MissionController::saveMap);
+  file->addAction("打开航线任务", this, &MissionController::openMission);
+  file->addAction("保存航线任务", this, &MissionController::saveMission);
+  file->addAction("下载任务机文件", this, &MissionController::requestFile);
+  auto addProcessingAction = [this](QMenu *menu, const QString &label,
+                                    const char *actionName) {
+    menu->addAction(label, this, [this, actionName] {
+      runCloudCompareAction(actionName);
+    });
+  };
+  auto *editMenu = bar->addMenu("编辑");
+  addProcessingAction(editMenu, "复制选中对象…", "actionClone");
+  addProcessingAction(editMenu, "抽稀…", "actionSubsample");
+  addProcessingAction(editMenu, "分割…", "actionSegment");
+  auto *processMenu = bar->addMenu("处理");
+  addProcessingAction(processMenu, "计算法向量…", "actionComputeNormals");
+  addProcessingAction(processMenu, "栅格化…", "actionRasterize");
+  addProcessingAction(processMenu, "ICP 配准…", "actionRegister");
+  addProcessingAction(processMenu, "对应点配准…", "actionPointPairsAlign");
+  auto *analysisMenu = bar->addMenu("分析");
+  addProcessingAction(analysisMenu, "点云到点云距离…", "actionCloudCloudDist");
+  addProcessingAction(analysisMenu, "点云到网格距离…", "actionCloudMeshDist");
   auto *taskMenu = bar->addMenu("任务机");
   taskMenu->addAction("任务机 YAML", this, &MissionController::yamlSettings);
   taskMenu->addAction("日志记录", this, [this] { latest_->click(); });
+  taskMenu->addAction("清空累积地图", this, [this] { clearAccumulatedMap(); });
   auto *startup = taskMenu->addMenu("任务启动");
   startup->addAction("启动 Odin", this,
                      [this] { command(mission::Command::START_ODIN); });
   startup->addAction("启动 EGO", this,
                      [this] { command(mission::Command::START_EGO); });
-  auto *file = bar->addMenu("文件");
-  file->addAction("加载 PCD / PLY 地图", this, &MissionController::loadMap);
-  file->addAction("保存点云 PCD", this, &MissionController::saveMap);
-  file->addAction("打开航线任务", this, &MissionController::openMission);
-  file->addAction("保存航线任务", this, &MissionController::saveMission);
-  file->addAction("下载任务机文件", this, &MissionController::requestFile);
-  auto *mapMenu = bar->addMenu("地图");
-  mapMenu->addAction("清空累积地图", this, [this] {
-    clearAccumulatedMap();
-  });
-  mapMenu->addAction("视图适配地图", this, [this] { gl_->zoomGlobal(); });
   auto *view = bar->addMenu("视图");
   view->addAction("等轴测", this, [this] { gl_->setView(CC_ISO_VIEW_1); });
   view->addAction("俯视", this, [this] { gl_->setView(CC_TOP_VIEW); });
@@ -787,11 +819,11 @@ void MissionController::buildUi() {
     b->setProperty("role", "toolbar");
     return b;
   };
-  accumulate_ = new QCheckBox("◉ 实时累积");
+  accumulate_ = new QCheckBox("实时累积");
   accumulate_->setChecked(true);
   accumulate_->setToolTip("将收到的实时点云累积成地图；取消勾选后保留已有地图，暂停累积");
   tools->addWidget(accumulate_);
-  addTool("＋ 添加航点", [this] {
+  addTool("＋ 航点", [this] {
     const int row = addWaypointAtAircraft();
     if (row < 0)
       return;
@@ -799,14 +831,14 @@ void MissionController::buildUi() {
     setEditorCollapsed(false);
     editWaypoint();
   });
-  picking_ = new QCheckBox("⌖ 点云拾取");
+  picking_ = new QCheckBox("点云拾取");
   tools->addWidget(picking_);
-  addTool("⌗ 适配视图", [this] { gl_->zoomGlobal(); });
+  addTool("适配", [this] { gl_->zoomGlobal(); });
   tools->addStretch(1);
   auto *viewButton =
-      addTool("3D · 自由视角", [this] { gl_->setView(CC_ISO_VIEW_1); });
+      addTool("自由视角", [this] { gl_->setView(CC_ISO_VIEW_1); });
   viewButton->setToolTip("返回等轴测视角；鼠标仍可旋转三维视图");
-  mapBadge_ = new QLabel("任务区域 · 等待地图\n任务航线 / EGO 规划 / 实际轨迹",
+  mapBadge_ = new QLabel("任务地图 · 等待数据",
                          canvas_);
   mapBadge_->setObjectName("mapBadge");
   mapBadge_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
@@ -1119,6 +1151,93 @@ void MissionController::buildUi() {
               videoWidget_->update();
           });
   video_->hide();
+  processingToolbar_ = card(canvas_, "");
+  processingToolbar_->setObjectName("missionToolbar");
+  auto *processingTools = new QHBoxLayout;
+  processingTools->setContentsMargins(0, 0, 0, 0);
+  processingTools->setSpacing(3);
+  box(processingToolbar_)->setContentsMargins(7, 4, 7, 4);
+  box(processingToolbar_)->addLayout(processingTools);
+  button(processingTools, "＋ 导入", [this] { importProcessingFiles(); });
+  button(processingTools, "地图快照", [this] { snapshotMap(); });
+  button(processingTools, "适配视图", [this] { gl_->zoomGlobal(); });
+  button(processingTools, "导出选中", [this] {
+    runCloudCompareAction("actionSave");
+  });
+  objectsCard_ = card(canvas_, "处理对象");
+  box(objectsCard_)->setContentsMargins(9, 7, 9, 9);
+  auto *objectsHint = new QLabel("独立对象 · 多选可用于配准和比较", objectsCard_);
+  objectsHint->setObjectName("mutedText");
+  objectsHint->setWordWrap(true);
+  box(objectsCard_)->addWidget(objectsHint);
+  processingObjects_ = new QListWidget(objectsCard_);
+  processingObjects_->setObjectName("processingObjects");
+  processingObjects_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+  processingObjects_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  processingObjects_->setTextElideMode(Qt::ElideMiddle);
+  processingObjects_->setMinimumHeight(160);
+  box(objectsCard_)->addWidget(processingObjects_);
+  connect(processingObjects_, &QListWidget::itemSelectionChanged, this, [this] {
+    auto *root = window_->dbRootObject();
+    if (!root)
+      return;
+    QSet<unsigned> selectedIds;
+    for (auto *item : processingObjects_->selectedItems())
+      selectedIds.insert(item->data(Qt::UserRole).toUInt());
+    ccHObject::Container selectedObjects;
+    for (int row = 0; row < processingObjects_->count(); ++row) {
+      const unsigned id = processingObjects_->item(row)->data(Qt::UserRole).toUInt();
+      if (selectedIds.contains(id)) {
+        if (auto *object = root->find(id))
+          selectedObjects.push_back(object);
+      }
+    }
+    window_->db()->selectEntities(selectedObjects);
+  });
+  button(box(objectsCard_), "＋ 导入文件", [this] { importProcessingFiles(); });
+  processingCard_ = card(canvas_, "处理工具");
+  box(processingCard_)->setContentsMargins(9, 7, 9, 9);
+  processingHint_ = new QLabel("选择点云或网格，再运行已编译的工具。", processingCard_);
+  processingHint_->setObjectName("mutedText");
+  processingHint_->setWordWrap(true);
+  box(processingCard_)->addWidget(processingHint_);
+  processingOnly_ = new QWidget(processingCard_);
+  auto *processingActions = new QVBoxLayout(processingOnly_);
+  processingActions->setContentsMargins(0, 0, 0, 0);
+  processingActions->setSpacing(4);
+  box(processingCard_)->addWidget(processingOnly_);
+  auto addCardTool = [this](QVBoxLayout *layout, const QString &label,
+                            const char *name) {
+    button(layout, label, [this, name] {
+      runCloudCompareAction(name);
+    });
+  };
+  addCardTool(processingActions, "复制对象", "actionClone");
+  addCardTool(processingActions, "抽稀", "actionSubsample");
+  addCardTool(processingActions, "计算法向量", "actionComputeNormals");
+  addCardTool(processingActions, "栅格化", "actionRasterize");
+  comparisonOnly_ = new QWidget(processingCard_);
+  auto *comparisonActions = new QVBoxLayout(comparisonOnly_);
+  comparisonActions->setContentsMargins(0, 0, 0, 0);
+  comparisonActions->setSpacing(4);
+  auto *comparisonInputs = new QFormLayout;
+  referenceObject_ = new QComboBox(comparisonOnly_);
+  targetObject_ = new QComboBox(comparisonOnly_);
+  comparisonInputs->addRow("参考", referenceObject_);
+  comparisonInputs->addRow("待测", targetObject_);
+  comparisonActions->addLayout(comparisonInputs);
+  connect(referenceObject_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+          this, [this] { selectComparisonPair(); });
+  connect(targetObject_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+          this, [this] { selectComparisonPair(); });
+  addCardTool(comparisonActions, "ICP 配准…", "actionRegister");
+  addCardTool(comparisonActions, "点云到点云距离…", "actionCloudCloudDist");
+  addCardTool(comparisonActions, "点云到网格距离…", "actionCloudMeshDist");
+  box(processingCard_)->addWidget(comparisonOnly_);
+  comparisonOnly_->hide();
+  processingToolbar_->hide();
+  objectsCard_->hide();
+  processingCard_->hide();
   left_->show();
   right_->show();
   top_->show();
@@ -1128,13 +1247,214 @@ void MissionController::buildUi() {
   protocolHint_ = new QLabel("Protobuf v1  ·  未连接", window_->statusBar());
   protocolHint_->setObjectName("mutedText");
   window_->statusBar()->addPermanentWidget(protocolHint_);
-  for (auto *cardWidget : {left_, mapPopover_, top_, editor_, h, s, o}) {
+  for (auto *cardWidget : {left_, mapPopover_, top_, editor_, h, s, o,
+                           processingToolbar_, objectsCard_, processingCard_}) {
     auto *shadow = new QGraphicsDropShadowEffect(cardWidget);
     shadow->setBlurRadius(22);
     shadow->setOffset(0, 4);
     shadow->setColor(QColor(7, 26, 37, 53));
     cardWidget->setGraphicsEffect(shadow);
   }
+  auto *objectRefresh = new QTimer(this);
+  objectRefresh->setInterval(900);
+  connect(objectRefresh, &QTimer::timeout, this,
+          &MissionController::refreshProcessingObjects);
+  objectRefresh->start();
+}
+void MissionController::setWorkspace(Workspace workspace) {
+  workspace_ = workspace;
+  const bool monitor = workspace == Workspace::Monitor;
+  if (!monitor && picking_ && picking_->isChecked())
+    picking_->setChecked(false);
+  if (!monitor && routeDialog_)
+    routeDialog_->hide();
+  if (mapPopover_)
+    mapPopover_->hide();
+  for (QWidget *widget : QVector<QWidget *>{left_, right_, top_, editor_, mapBadge_})
+    widget->setVisible(monitor);
+  for (auto *widget : {objectsCard_, processingCard_, processingToolbar_})
+    widget->setVisible(!monitor);
+  processingOnly_->setVisible(workspace == Workspace::Processing);
+  comparisonOnly_->setVisible(workspace == Workspace::Comparison);
+  if (auto *action = workspaceActions_.value(static_cast<int>(workspace)))
+    action->setChecked(true);
+  if (!monitor) {
+    auto *title = processingCard_->findChild<QLabel *>("cardTitle");
+    if (title)
+      title->setText(workspace == Workspace::Comparison ? "对比分析" : "处理工具");
+    processingHint_->setText(
+        workspace == Workspace::Comparison
+            ? "选择两个对象，使用 ICP 配准或计算点云距离。"
+            : "选择处理对象；工具使用 CloudCompare 原有算法与对话框。");
+    refreshProcessingObjects();
+    if (workspace == Workspace::Comparison)
+      selectComparisonPair();
+  }
+  arrange();
+}
+void MissionController::refreshProcessingObjects() {
+  if (!processingObjects_ || workspace_ == Workspace::Monitor)
+    return;
+  auto *root = window_->dbRootObject();
+  if (!root)
+    return;
+  QVector<QPair<unsigned, QString>> objects;
+  std::function<void(ccHObject *, int)> collect = [&](ccHObject *parent,
+                                                       int depth) {
+    for (unsigned i = 0; i < parent->getChildrenNumber(); ++i) {
+      auto *child = parent->getChild(i);
+      const bool pointCloud = child->isKindOf(CC_TYPES::POINT_CLOUD);
+      const bool mesh = child->isKindOf(CC_TYPES::MESH);
+      if (pointCloud || mesh) {
+        objects.append({child->getUniqueID(),
+                        QString(depth * 2, QChar(' ')) +
+                            (mesh ? "▧ " : "☁ ") + child->getName()});
+      }
+      if (!mesh)
+        collect(child, depth + 1);
+    }
+  };
+  collect(root, 0);
+  bool changed = objects.size() != processingObjects_->count();
+  if (!changed) {
+    for (int i = 0; i < objects.size(); ++i) {
+      auto *item = processingObjects_->item(i);
+      if (item->data(Qt::UserRole).toUInt() != objects[i].first ||
+          item->text() != objects[i].second) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  QSet<unsigned> selectedIds;
+  for (auto *object : window_->getSelectedEntities())
+    selectedIds.insert(object->getUniqueID());
+  QSignalBlocker blocked(processingObjects_);
+  if (changed) {
+    processingObjects_->clear();
+    for (const auto &object : objects) {
+      auto *item = new QListWidgetItem(object.second, processingObjects_);
+      item->setData(Qt::UserRole, object.first);
+      item->setToolTip(object.second.trimmed());
+    }
+  }
+  if (changed) {
+    const unsigned previousReference = referenceObject_->currentData().toUInt();
+    const unsigned previousTarget = targetObject_->currentData().toUInt();
+    const QSignalBlocker referenceBlocked(referenceObject_);
+    const QSignalBlocker targetBlocked(targetObject_);
+    referenceObject_->clear();
+    targetObject_->clear();
+    for (const auto &object : objects) {
+      const QString name = object.second.trimmed();
+      const QString compact = name.size() > 18
+                                  ? name.left(6) + "…" + name.right(10)
+                                  : name;
+      referenceObject_->addItem(compact, object.first);
+      targetObject_->addItem(compact, object.first);
+      referenceObject_->setItemData(referenceObject_->count() - 1, name,
+                                    Qt::ToolTipRole);
+      targetObject_->setItemData(targetObject_->count() - 1, name,
+                                 Qt::ToolTipRole);
+    }
+    if (referenceObject_->count()) {
+      referenceObject_->setCurrentIndex(
+          qMax(0, referenceObject_->findData(previousReference)));
+      targetObject_->setCurrentIndex(
+          qMax(0, targetObject_->findData(previousTarget)));
+      if (objects.size() > 1 &&
+          targetObject_->currentData() == referenceObject_->currentData())
+        targetObject_->setCurrentIndex(referenceObject_->currentIndex() == 0 ? 1 : 0);
+    }
+  }
+  for (int i = 0; i < processingObjects_->count(); ++i) {
+    auto *item = processingObjects_->item(i);
+    item->setSelected(selectedIds.contains(item->data(Qt::UserRole).toUInt()));
+  }
+  if (objects.isEmpty())
+    processingHint_->setText("尚无处理对象。导入文件，或为实时地图创建快照。");
+}
+void MissionController::selectComparisonPair() {
+  if (workspace_ != Workspace::Comparison || !processingObjects_)
+    return;
+  const unsigned reference = referenceObject_->currentData().toUInt();
+  const unsigned target = targetObject_->currentData().toUInt();
+  if (!reference || !target || reference == target) {
+    processingHint_->setText("参考和待测必须是两个不同对象。");
+    return;
+  }
+  auto *root = window_->dbRootObject();
+  if (!root)
+    return;
+  ccHObject::Container pair;
+  if (auto *object = root->find(reference))
+    pair.push_back(object);
+  if (auto *object = root->find(target))
+    pair.push_back(object);
+  window_->db()->selectEntities(pair);
+  refreshProcessingObjects();
+  processingHint_->setText("已选择参考与待测对象；距离方向可在原工具对话框确认。");
+}
+void MissionController::importProcessingFiles() {
+  QSettings settings("3DG", "Mission");
+  const QStringList paths = QFileDialog::getOpenFileNames(
+      window_, "导入处理对象", settings.value("processingDir").toString(),
+      FileIOFilter::ImportFilterList().join(";;"));
+  if (paths.isEmpty())
+    return;
+  settings.setValue("processingDir", QFileInfo(paths.first()).absolutePath());
+  window_->addToDB(paths, QString(), gl_);
+  setWorkspace(Workspace::Processing);
+  refreshProcessingObjects();
+  log(QString("已请求导入 %1 个处理文件").arg(paths.size()), "点云处理");
+}
+void MissionController::snapshotMap() {
+  const auto &source = !mapPoints_.isEmpty() ? mapPoints_ : livePoints_;
+  if (source.isEmpty()) {
+    log("当前没有可快照的地图或实时点云", "点云处理");
+    return;
+  }
+  auto *cloud = new ccPointCloud(
+      QString("地图快照_%1").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
+  if (!cloud->reserve(source.size()) || !cloud->reserveTheRGBTable()) {
+    delete cloud;
+    log("地图快照内存分配失败", "点云处理");
+    return;
+  }
+  for (const auto &point : source) {
+    cloud->addPoint(CCVector3(point.x, point.y, point.z));
+    cloud->addColor(point.r, point.g, point.b);
+  }
+  cloud->showColors(true);
+  cloud->setPointSize(2);
+  cloud->setMetaData("3dg.source", mapPoints_.isEmpty() ? "live" : "map");
+  cloud->setMetaData("3dg.mapId", mapId_);
+  cloud->setMetaData("3dg.frame", frame_);
+  cloud->setMetaData("3dg.unit", "m");
+  cloud->setMetaData("3dg.capturedAt", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+  cloud->setDisplay(gl_);
+  window_->addToDB(cloud, false, true, false, true);
+  setWorkspace(Workspace::Processing);
+  refreshProcessingObjects();
+  log(QString("已创建 %1 点地图快照").arg(source.size()), "点云处理");
+}
+void MissionController::runCloudCompareAction(const char *objectName) {
+  auto *action = window_->findChild<QAction *>(QString::fromLatin1(objectName));
+  if (!action) {
+    log(QString("当前构建不包含工具 %1").arg(objectName), "点云处理");
+    return;
+  }
+  if (!action->isEnabled()) {
+    const QString message = QString("%1：请检查选中对象的数量与类型")
+                                .arg(action->text().remove('&'));
+    processingHint_->setText(message);
+    log(message, "点云处理");
+    return;
+  }
+  if (picking_ && picking_->isChecked())
+    picking_->setChecked(false);
+  action->trigger();
+  QTimer::singleShot(0, this, &MissionController::refreshProcessingObjects);
 }
 void MissionController::refreshMapInfo() {
   if (mapInfo_)
@@ -1145,7 +1465,7 @@ void MissionController::refreshMapInfo() {
                           .arg(mapPoints_.size()));
   if (mapBadge_)
     mapBadge_->setText(
-        QString("本地 %1 个 · 任务机 %2 个航点\n本地航线 / 机载航点 / EGO 规划")
+        QString("航点 本地 %1 · 机载 %2  |  EGO · 轨迹")
             .arg(mission_.waypoints_size()).arg(remotePoints_.size()));
   if (window_)
     window_->statusBar()->showMessage("地图坐标：" + frame_ + "　·　单位：m");
@@ -1242,14 +1562,23 @@ void MissionController::arrange() {
                            mapPopover_->sizeHint().height());
   right_->setGeometry(w - rightWidth - margin, margin, rightWidth,
                       right_->sizeHint().height());
-  top_->setGeometry(centerX, margin, toolbarCollapsed_ ? 44 : centerWidth, 46);
-  mapBadge_->setGeometry(centerX + 2, margin + 56, qMin(268, centerWidth / 2),
-                         51);
+  top_->setGeometry(centerX, margin,
+                    toolbarCollapsed_ ? 44 : qMin(centerWidth, 450), 46);
+  objectsCard_->setGeometry(margin, margin + 58, 190,
+                            qMin(h - margin * 2 - 64, 320));
+  processingCard_->setGeometry(w - margin - 234, margin + 58, 234,
+                               qMin(h - margin * 2 - 64,
+                                    processingCard_->sizeHint().height()));
+  processingToolbar_->setGeometry(
+      qMax(210, (w - 450) / 2), margin, qMin(450, w - 440), 46);
   const int editorWidth = qMin(440, centerWidth - 4);
   const int editorHeight = qMin(h - margin * 2, editor_->sizeHint().height());
   const int editorX = centerX + (centerWidth - editorWidth) / 2;
   const int editorY = h - editorHeight - margin;
   editor_->setGeometry(editorX, editorY, editorWidth, editorHeight);
+  mapBadge_->setGeometry(centerX,
+                         editorX < centerX + 302 ? editorY - 44 : h - margin - 34,
+                         302, 34);
   if (!dragging_ && !videoPlaced_) {
     video_->move(centerX + 2,
                  qMax(margin + 120,
@@ -1268,6 +1597,11 @@ void MissionController::arrange() {
   left_->raise();
   right_->raise();
   editor_->raise();
+  if (workspace_ != Workspace::Monitor) {
+    objectsCard_->raise();
+    processingCard_->raise();
+    processingToolbar_->raise();
+  }
   if (video_->isVisible())
     video_->raise();
   if (mapPopover_->isVisible())

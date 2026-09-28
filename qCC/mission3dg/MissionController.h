@@ -24,6 +24,7 @@ class QAction;
 class QTableWidget;
 class QDoubleSpinBox;
 class QListWidget;
+class QComboBox;
 class QMediaPlayer;
 class VideoCanvas;
 class QCheckBox;
@@ -43,6 +44,13 @@ public:
 private:
   void buildUi();
   void arrange();
+  enum class Workspace { Monitor, Processing, Comparison };
+  void setWorkspace(Workspace workspace);
+  void refreshProcessingObjects();
+  void selectComparisonPair();
+  void importProcessingFiles();
+  void snapshotMap();
+  void runCloudCompareAction(const char *objectName);
   void refreshMapInfo();
   void refreshStartupButtons();
   void refreshMediaButtons();
@@ -109,7 +117,14 @@ private:
   bool referenceMap_ = false;
   QFrame *left_ = nullptr, *right_ = nullptr, *top_ = nullptr,
          *editor_ = nullptr, *video_ = nullptr, *logPopup_ = nullptr,
-         *mapPopover_ = nullptr;
+         *mapPopover_ = nullptr, *objectsCard_ = nullptr,
+         *processingCard_ = nullptr, *processingToolbar_ = nullptr;
+  QWidget *processingOnly_ = nullptr, *comparisonOnly_ = nullptr;
+  QListWidget *processingObjects_ = nullptr;
+  QComboBox *referenceObject_ = nullptr, *targetObject_ = nullptr;
+  QLabel *processingHint_ = nullptr;
+  Workspace workspace_ = Workspace::Monitor;
+  QHash<int, QAction *> workspaceActions_;
   QWidget *toolbarContents_ = nullptr;
   QPushButton *toolbarFold_ = nullptr;
   QWidget *routeDetails_ = nullptr, *routeStrip_ = nullptr;
