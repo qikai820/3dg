@@ -48,13 +48,13 @@
  */
 class DXFLIB_EXPORT DL_WriterA : public DL_Writer {
 public:
-#ifdef _WIN32
+#ifdef _MSC_VER
     DL_WriterA(const std::wstring& fname,
 #else
 	DL_WriterA(const std::string& fname,
 #endif
                DL_Codes::version version=DL_VERSION_2000)
-            : DL_Writer(version), m_ofile(fname) {}
+            : DL_Writer(version), m_ofile(fname.c_str()) {}
     virtual ~DL_WriterA() {}
 
     bool openFailed() const;
@@ -80,4 +80,3 @@ private:
 };
 
 #endif
-

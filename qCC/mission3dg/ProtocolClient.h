@@ -1,4 +1,7 @@
 #pragma once
+#ifdef ERROR
+#undef ERROR // Windows headers define ERROR and collide with LogEntry::ERROR.
+#endif
 #include "mission.pb.h"
 #include <QElapsedTimer>
 #include <QHash>

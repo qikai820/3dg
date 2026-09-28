@@ -55,6 +55,8 @@ endif()
 if( WIN32 )
 	if (MSVC)
 		set_target_properties( ${PROJECT_NAME} PROPERTIES LINK_FLAGS " /MANIFEST:NO" )
+	elseif( MINGW )
+		set_target_properties( ${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE )
 	endif()
 endif()
 

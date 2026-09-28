@@ -1,5 +1,6 @@
 #undef QT_USE_QSTRINGBUILDER
 #include "MissionController.h"
+#include "QuadrotorModel.h"
 #include "mainwindow.h"
 #include <FileIOFilter.h>
 #include <QAbstractVideoSurface>
@@ -336,8 +337,10 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
   QString position = "—", angles = "—", speed = "—";
   if (s.pose_valid()) {
     auto p = vec(s.position());
-    if (history_.isEmpty() || (history_.last() - p).length() > .05f)
+    if (history_.isEmpty() || (history_.last() - p).length() > .05f) {
       history_ << p;
+      trailDirty_ = dirty_ = true;
+    }
     if (history_.size() > 20000)
       history_.remove(0, 1000);
     auto &q = s.orientation();
@@ -369,7 +372,10 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
   batteryBar_->setValue(
       s.battery_valid() ? qBound(0, int(s.battery_percent()), 100) : 0);
   attitude_->update();
-  dirty_ = true;
+  // Pose is latency-sensitive and cheap: do not wait for the 10 Hz cloud pass.
+  updateAircraftPose();
+  if (gl_)
+    gl_->redraw(); // Qt coalesces paint requests; geometry remains cached.
 }
 MissionController::MissionController(MainWindow *w)
     : QObject(w), window_(w), gl_(w->getActiveGLWindow()), client_(this) {
@@ -389,11 +395,18 @@ MissionController::MissionController(MainWindow *w)
   };
   live_ = group("实时点云");
   map_ = group("参考地图");
-  route_ = group("任务航线");
+  route_ = group("本地任务航线");
+  remoteRoute_ = group("任务机航点（只读）");
   ego_ = group("EGO 规划");
   grid_ = group("EGO 栅格地图");
   trail_ = group("实际轨迹");
   aircraft_ = group("无人机");
+  aircraftModel_ = createQuadrotorModel();
+  if (aircraftModel_) {
+    aircraftModel_->setDisplay(gl_);
+    aircraftModel_->setVisible(false);
+    aircraft_->addChild(aircraftModel_);
+  }
   mission_.set_mission_id(
       QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString());
   QSettings s("3DG", "Mission");
@@ -404,6 +417,13 @@ MissionController::MissionController(MainWindow *w)
   voxel_ = s.value("voxel", voxel_).toDouble();
   cloudHz_ = s.value("hz", cloudHz_).toDouble();
   clearance_ = s.value("clearance", clearance_).toDouble();
+  const QColor savedGridColor(s.value("gridColor", gridColor_.name()).toString());
+  if (savedGridColor.isValid())
+    gridColor_ = savedGridColor;
+  const double savedGridOpacity = s.value("gridOpacity", gridOpacity_).toDouble();
+  if (std::isfinite(savedGridOpacity) && savedGridOpacity >= 0.0 &&
+      savedGridOpacity <= 1.0)
+    gridOpacity_ = savedGridOpacity;
   if (!std::isfinite(voxel_) || voxel_ < .02 || voxel_ > 5)
     voxel_ = .15;
   const auto logs =
@@ -415,6 +435,7 @@ MissionController::MissionController(MainWindow *w)
       ".log");
   logFile_.open(QIODevice::WriteOnly | QIODevice::Append);
   buildUi();
+  restoreAccumulatedMap();
   // The standard CloudCompare tree only owns its main DB. Mission overlays live
   // in the GL window's own DB and some are replaced on every telemetry frame.
   // Sending their pointers to the hidden tree creates persistent QModelIndex
@@ -446,12 +467,22 @@ MissionController::MissionController(MainWindow *w)
   connect(&client_, &ProtocolClient::stateChanged, this,
           [this](const QString &t, bool r) {
             ready_ = r;
+            if (r)
+              requestRemoteRoute();
+            else
+              clearRemoteRoute();
             mode_->setText(demo_ ? "● 模拟演示 · 非真实遥测"
                                  : (r ? "● " + t : "○ " + t));
             connectButton_->setText(r ? "断开" : "连接");
             if (!r) {
+              statusAge_.invalidate();
+              pendingKinds_.clear();
+              mediaOperations_.clear();
+              mediaErrors_.clear();
+              refreshStartupButtons();
               lastVehicle_.set_pose_valid(false);
-              aircraft_->removeAllChildren();
+              if (aircraftModel_)
+                aircraftModel_->setVisible(false);
               ego_->setVisible(false);
               expireGrid();
               dirty_ = true;
@@ -476,12 +507,19 @@ MissionController::MissionController(MainWindow *w)
                                               : "Protobuf v1  ·  未连接"));
           });
   connect(&demoTimer_, &QTimer::timeout, this, &MissionController::demoTick);
-  demoTimer_.setInterval(100);
+  demoTimer_.setTimerType(Qt::PreciseTimer);
+  demoTimer_.setInterval(20);
   connect(&redraw_, &QTimer::timeout, this, &MissionController::updateScene);
   redraw_.start(100);
+  connect(&autosaveTimer_, &QTimer::timeout, this, [this] {
+    if (accumulationDirty_)
+      saveAccumulatedMap();
+  });
+  autosaveTimer_.start(30000);
   connect(&staleTimer_, &QTimer::timeout, this, [this] {
     if (!gl_)
       return;
+    refreshStartupButtons();
     if (!demo_ && statusAge_.isValid() && statusAge_.elapsed() > 3000)
       status_->setText(
           "任务机网络　　状态已过期\nOdin1　　　　　 "
@@ -494,7 +532,8 @@ MissionController::MissionController(MainWindow *w)
       hud_->setText("遥测已过期（超过 3 秒）\n姿态 / 速度 / 位置 / 电量：—");
       attitude_->valid = false;
       attitude_->update();
-      aircraft_->removeAllChildren();
+      if (aircraftModel_)
+        aircraftModel_->setVisible(false);
       lastVehicle_.set_pose_valid(false);
       gl_->redraw();
     }
@@ -510,11 +549,18 @@ MissionController::MissionController(MainWindow *w)
           [this](ccGLWindowInterface *) {
             gl_ = nullptr;
             root_ = nullptr;
+            aircraftModel_ = nullptr;
             demoTimer_.stop();
             redraw_.stop();
           });
   arrange();
+  if (!mapPoints_.isEmpty()) {
+    updateScene();
+    gl_->zoomGlobal();
+  }
   log("3DG 已就绪。可加载地图、编辑航线，或开启模拟演示。");
+  if (!aircraftModel_)
+    log("X500 模型资源加载失败，无法显示无人机模型");
   if (qEnvironmentVariableIsSet("THREEDG_DEMO"))
     setDemo(true);
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_VIDEO")) {
@@ -526,6 +572,8 @@ MissionController::MissionController(MainWindow *w)
     QTimer::singleShot(4500, this, &MissionController::smoke);
 }
 MissionController::~MissionController() {
+  if (accumulationDirty_)
+    saveAccumulatedMap();
   client_.stop();
   demoTimer_.stop();
   redraw_.stop();
@@ -540,6 +588,7 @@ MissionController::~MissionController() {
   delete right_;
   delete top_;
   delete editor_;
+  delete routeDialog_;
   delete mapBadge_;
   delete video_;
   delete logPopup_;
@@ -577,6 +626,11 @@ void MissionController::buildUi() {
       "QPushButton:hover,QToolButton:hover{background:#e0f7f2;border-color:#"
       "70ccb8;}"
       "QPushButton:pressed,QToolButton:pressed{background:#c9eee6;}"
+      "QPushButton[serviceRunning=true]{background:#218653;color:white;"
+      "border-color:#197044;}"
+      "QPushButton[serviceRunning=true]:hover{background:#197044;}"
+      "QPushButton[serviceRunning=true]:pressed{background:#125735;}"
+      "QPushButton:disabled{background:#e4ebef;color:#7b8d98;border-color:#d0dce3;}"
       "QPushButton:checked,QToolButton:checked{background:#c9f2e9;border-color:"
       "#52bfa9;"
       "color:#147a68;}"
@@ -610,7 +664,8 @@ void MissionController::buildUi() {
       "QTableWidget,QListWidget,QLineEdit,QDoubleSpinBox,QComboBox{color:#"
       "304756;"
       "background:rgba(255,255,255,225);border:1px solid #ccdae3;"
-      "border-radius:6px;selection-background-color:#d4f3ec;}"
+      "border-radius:6px;selection-background-color:#d4f3ec;"
+      "selection-color:#204356;}"
       "QTableWidget{gridline-color:#e0eaf0;}"
       "QHeaderView::section{background:#e6eff4;color:#586f7d;border:0;padding:"
       "4px;}"
@@ -638,11 +693,8 @@ void MissionController::buildUi() {
   auto *monitorNav = bar->addAction("任务监控");
   connect(monitorNav, &QAction::triggered, this,
           [this] { setEditorCollapsed(true); });
-  auto *routeNav = bar->addAction("航点编辑");
-  connect(routeNav, &QAction::triggered, this,
-          [this] { setEditorCollapsed(false); });
   auto *taskMenu = bar->addMenu("任务机");
-  taskMenu->addAction("任务设置", this, &MissionController::settings);
+  taskMenu->addAction("任务机 YAML", this, &MissionController::yamlSettings);
   taskMenu->addAction("日志记录", this, [this] { latest_->click(); });
   auto *startup = taskMenu->addMenu("任务启动");
   startup->addAction("启动 Odin", this,
@@ -657,19 +709,19 @@ void MissionController::buildUi() {
   file->addAction("下载任务机文件", this, &MissionController::requestFile);
   auto *mapMenu = bar->addMenu("地图");
   mapMenu->addAction("清空累积地图", this, [this] {
-    voxels_.clear();
-    mapPoints_.clear();
-    mapDirty_ = true;
-    dirty_ = true;
+    clearAccumulatedMap();
   });
   mapMenu->addAction("视图适配地图", this, [this] { gl_->zoomGlobal(); });
   auto *view = bar->addMenu("视图");
   view->addAction("等轴测", this, [this] { gl_->setView(CC_ISO_VIEW_1); });
   view->addAction("俯视", this, [this] { gl_->setView(CC_TOP_VIEW); });
+  view->addAction("定位无人机", this, &MissionController::focusAircraft);
   view->addAction("悬浮视频窗口", this, &MissionController::showVideo);
   auto *demo = view->addAction("模拟演示（非真实遥测）");
   demo->setCheckable(true);
   connect(demo, &QAction::toggled, this, &MissionController::setDemo);
+  auto *settingsMenu = bar->addMenu("设置");
+  settingsMenu->addAction("3DG 配置", this, &MissionController::settings);
   latest_ = new QPushButton("● 3DG 已就绪 ▾", bar);
   latest_->setFixedSize(350, 30);
   latest_->setObjectName("latestLog");
@@ -690,12 +742,12 @@ void MissionController::buildUi() {
   box(logPopup_)->addWidget(logCount_);
   auto *logActions = new QHBoxLayout;
   box(logPopup_)->addLayout(logActions);
-  button(logActions, "开始记录", [this] {
-    command(mission::Command::RECORD_START);
+  logRecordButton_ = button(logActions, "开始记录", [this] {
+    toggleMedia(mission::Command::RECORD_START);
   });
-  button(logActions, "停止记录", [this] {
-    command(mission::Command::RECORD_STOP);
-  });
+  logRecordState_ = new QLabel;
+  logRecordState_->setObjectName("mutedText");
+  logActions->addWidget(logRecordState_);
   button(logActions, "回到最新", [this] {
     logList_->scrollToBottom();
     unread_ = 0;
@@ -714,24 +766,36 @@ void MissionController::buildUi() {
   top_ = card(canvas_, "");
   top_->setObjectName("missionToolbar");
   box(top_)->setContentsMargins(7, 4, 7, 4);
-  auto *tools = new QHBoxLayout;
+  auto *toolbarRow = new QHBoxLayout;
+  toolbarRow->setContentsMargins(0, 0, 0, 0);
+  toolbarRow->setSpacing(2);
+  box(top_)->addLayout(toolbarRow);
+  toolbarFold_ = button(toolbarRow, "◀", [this] {
+    setToolbarCollapsed(!toolbarCollapsed_);
+  });
+  toolbarFold_->setProperty("role", "toolbar");
+  toolbarFold_->setFixedWidth(30);
+  toolbarFold_->setToolTip("向左收起工具栏");
+  toolbarFold_->setAccessibleName("向左收起工具栏");
+  toolbarContents_ = new QWidget(top_);
+  toolbarRow->addWidget(toolbarContents_, 1);
+  auto *tools = new QHBoxLayout(toolbarContents_);
   tools->setContentsMargins(0, 0, 0, 0);
   tools->setSpacing(2);
-  box(top_)->addLayout(tools);
   auto addTool = [&](const QString &label, std::function<void()> action) {
     auto *b = button(tools, label, std::move(action));
     b->setProperty("role", "toolbar");
     return b;
   };
-  auto *editorTool = addTool("✧ 航点编辑", [this] {
-    setEditorCollapsed(!editorCollapsed_);
-  });
-  editorTool->setToolTip("展开或折叠航点任务");
   accumulate_ = new QCheckBox("◉ 实时累积");
+  accumulate_->setChecked(true);
+  accumulate_->setToolTip("将收到的实时点云累积成地图；取消勾选后保留已有地图，暂停累积");
   tools->addWidget(accumulate_);
   addTool("＋ 添加航点", [this] {
-    addWaypoint(QVector3D(0, 0, altitude_->value()));
-    waypoints_->selectRow(waypoints_->rowCount() - 1);
+    const int row = addWaypointAtAircraft();
+    if (row < 0)
+      return;
+    waypoints_->selectRow(row);
     setEditorCollapsed(false);
     editWaypoint();
   });
@@ -752,8 +816,10 @@ void MissionController::buildUi() {
   l->setContentsMargins(5, 7, 5, 7);
   l->setSpacing(5);
   const QVector<std::tuple<QString, QString, ccHObject *>> layerTools = {
-      {"☁", "实时彩色点云", live_}, {"▧", "参考地图", map_},
-      {"⌁", "任务航线", route_}, {"∿", "EGO 实时规划", ego_},
+      {"☁", "实时彩色点云", live_}, {"▧", "累积 / 参考地图", map_},
+      {"⌁", "本地任务航线", route_},
+      {"◇", "任务机航点（只读）", remoteRoute_},
+      {"∿", "EGO 实时规划", ego_},
       {"▦", "EGO 栅格地图", grid_},
       {"◎", "飞机实际轨迹", trail_}};
   for (const auto &entry : layerTools) {
@@ -842,26 +908,42 @@ void MissionController::buildUi() {
   routeSummary_->setObjectName("mutedText");
   routeHeading->addWidget(routeSummary_);
   routeHeading->addStretch();
-  routeFold_ = button(routeHeading, "展开 ▾", [this] {
+  auto *remoteRouteButton = button(routeHeading, "机载航点", [this] {
+    requestRemoteRoute();
+    setEditorCollapsed(false);
+  });
+  remoteRouteButton->setToolTip("从任务机重新读取当前 EGO 航点（只读）");
+  routeFold_ = button(routeHeading, "查看 ↗", [this] {
     setEditorCollapsed(!editorCollapsed_);
   });
-  routeFold_->setAccessibleName("展开航点任务");
+  routeFold_->setAccessibleName("查看航点任务弹窗");
   routeStrip_ = new QWidget(editor_);
   auto *strip = new QHBoxLayout(routeStrip_);
   strip->setContentsMargins(0, 0, 0, 0);
   strip->setSpacing(3);
   routeStrip_->setFixedHeight(31);
   edit->addWidget(routeStrip_);
-  routeDetails_ = new QWidget(editor_);
+  routeDialog_ = new QDialog(window_);
+  routeDialog_->setWindowTitle("航点任务 · 本地与机载");
+  routeDialog_->setModal(false);
+  routeDialog_->resize(660, 440);
+  routeDialog_->setMinimumSize(540, 340);
+  auto *popup = new QVBoxLayout(routeDialog_);
+  popup->setContentsMargins(12, 10, 12, 12);
+  routeDetails_ = new QWidget(routeDialog_);
   auto *details = new QVBoxLayout(routeDetails_);
-  details->setContentsMargins(0, 2, 0, 0);
-  details->setSpacing(8);
-  edit->addWidget(routeDetails_);
-  auto *instruction = new QLabel("双击航点修改位置、航向和速度", editor_);
+  details->setContentsMargins(0, 0, 0, 0);
+  details->setSpacing(6);
+  popup->addWidget(routeDetails_);
+  connect(routeDialog_, &QDialog::finished, this,
+          [this] { setEditorCollapsed(true); });
+  auto *instruction = new QLabel("添加默认取飞机当前 XYZ；本地航点可双击编辑；机载航点只读", routeDetails_);
   instruction->setObjectName("mutedText");
   details->addWidget(instruction);
+  auto *routeOptions = new QHBoxLayout;
+  details->addLayout(routeOptions);
   follow_ = new QCheckBox("跟随飞机");
-  details->addWidget(follow_);
+  routeOptions->addWidget(follow_);
   connect(picking_, &QCheckBox::toggled, this, [this](bool on) {
     if (on) {
       if (!window_->pickingHub()->addListener(this, true)) {
@@ -874,16 +956,26 @@ void MissionController::buildUi() {
   altitude_ = new QDoubleSpinBox;
   altitude_->setRange(-1000, 10000);
   altitude_->setValue(3);
-  altitude_->setSuffix(" m · 航点 Z");
-  details->addWidget(altitude_);
-  waypoints_ = new QTableWidget(0, 4);
-  waypoints_->setHorizontalHeaderLabels({"点", "X", "Y", "Z"});
+  altitude_->setSuffix(" m · 拾取点 Z");
+  altitude_->setToolTip("点云拾取航点时使用；添加按钮取飞机当前 XYZ");
+  altitude_->setMaximumWidth(180);
+  routeOptions->addWidget(altitude_);
+  routeOptions->addStretch();
+  waypoints_ = new QTableWidget(0, 7, routeDetails_);
+  waypoints_->setHorizontalHeaderLabels(
+      {"来源", "点", "X", "Y", "Z", "类型", "停留"});
   waypoints_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+  waypoints_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+  waypoints_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
   waypoints_->verticalHeader()->hide();
   waypoints_->setSelectionBehavior(QAbstractItemView::SelectRows);
+  waypoints_->setSelectionMode(QAbstractItemView::SingleSelection);
   waypoints_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-  waypoints_->setFixedHeight(170);
-  details->addWidget(waypoints_);
+  details->addWidget(waypoints_, 1);
+  remoteRouteInfo_ = new QLabel("任务机航点尚未读取 · 只读", routeDetails_);
+  remoteRouteInfo_->setObjectName("mutedText");
+  remoteRouteInfo_->setWordWrap(true);
+  details->addWidget(remoteRouteInfo_);
   gizmo_ = new WaypointGizmo(
       canvas_, gl_, [this](int axis, double distance) {
         moveWaypointAlongAxis(axis, distance);
@@ -898,32 +990,34 @@ void MissionController::buildUi() {
           [this](int, int) { editWaypoint(); });
   auto *row = new QHBoxLayout;
   details->addLayout(row);
-  button(row, "添加", [this] {
-    addWaypoint(QVector3D(0, 0, altitude_->value()));
-    waypoints_->selectRow(waypoints_->rowCount() - 1);
+  button(row, "添加本地", [this] {
+    const int row = addWaypointAtAircraft();
+    if (row < 0)
+      return;
+    waypoints_->selectRow(row);
     editWaypoint();
   });
-  button(row, "删除", [this] {
+  button(row, "删除本地", [this] {
     int n = waypoints_->currentRow();
-    if (n >= 0) {
+    if (n >= 0 && n < mission_.waypoints_size()) {
       mission_.mutable_waypoints()->DeleteSubrange(n, 1);
       rebuildRoute();
     }
   });
-  button(row, "上移", [this] {
+  button(row, "本地上移", [this] {
     int n = waypoints_->currentRow();
-    if (n > 0) {
+    if (n > 0 && n < mission_.waypoints_size()) {
       mission_.mutable_waypoints()->SwapElements(n, n - 1);
       rebuildRoute();
       waypoints_->selectRow(n - 1);
     }
   });
-  button(details, "保存航线任务", [this] { saveMission(); });
+  button(details, "保存本地航线", [this] { saveMission(); });
   button(details, "清空飞机轨迹", [this] {
     history_.clear();
-    dirty_ = true;
+    trailDirty_ = dirty_ = true;
   });
-  routeDetails_->hide();
+  routeDialog_->hide();
   editor_->show();
   refreshRouteStrip();
   right_ = new QFrame(canvas_);
@@ -960,9 +1054,7 @@ void MissionController::buildUi() {
       {"启动 Odin1", mission::Command::START_ODIN},
       {"启动 EGO", mission::Command::START_EGO},
       {"开启视频", mission::Command::VIDEO_START},
-      {"停止视频", mission::Command::VIDEO_STOP},
       {"开始记录", mission::Command::RECORD_START},
-      {"停止记录", mission::Command::RECORD_STOP},
       {"保存机载地图", mission::Command::SAVE_MAP},
       {"上传航线", mission::Command::UPLOAD_MISSION},
       {"结束任务", mission::Command::END_MISSION}};
@@ -972,14 +1064,31 @@ void MissionController::buildUi() {
     if (op.second == mission::Command::END_MISSION)
       b->setObjectName("dangerButton");
     commands_[op.second] = b;
-    if (op.second == mission::Command::END_MISSION)
-      grid->addWidget(b, i / 2, 0, 1, 2);
-    else
-      grid->addWidget(b, i / 2, i % 2);
-    connect(b, &QPushButton::clicked, this,
-            [this, k = op.second] { command(k); });
+    if (op.second == mission::Command::VIDEO_START ||
+        op.second == mission::Command::RECORD_START) {
+      auto *cell = new QVBoxLayout;
+      cell->setSpacing(3);
+      cell->addWidget(b);
+      auto *state = new QLabel;
+      state->setObjectName("mutedText");
+      state->setAlignment(Qt::AlignCenter);
+      state->setWordWrap(true);
+      cell->addWidget(state);
+      mediaStates_[op.second] = state;
+      grid->addLayout(cell, i / 2, i % 2);
+      connect(b, &QPushButton::clicked, this,
+              [this, k = op.second] { toggleMedia(k); });
+    } else {
+      if (op.second == mission::Command::END_MISSION)
+        grid->addWidget(b, i / 2, 0, 1, 2);
+      else
+        grid->addWidget(b, i / 2, i % 2);
+      connect(b, &QPushButton::clicked, this,
+              [this, k = op.second] { command(k); });
+    }
     ++i;
   }
+  refreshStartupButtons();
   video_ = new QFrame(canvas_);
   video_->setObjectName("videoOverlay");
   auto *videoLayout = new QVBoxLayout(video_);
@@ -1029,73 +1138,95 @@ void MissionController::buildUi() {
 }
 void MissionController::refreshMapInfo() {
   if (mapInfo_)
-    mapInfo_->setText(QString("坐标系  %1\n地图 ID  %2\n累积点  %3")
+    mapInfo_->setText(QString("坐标系  %1\n地图 ID  %2\n实时点  %3\n%4  %5")
                           .arg(frame_, mapId_)
-                          .arg(mapPoints_.isEmpty() ? livePoints_.size()
-                                                    : mapPoints_.size()));
+                          .arg(livePoints_.size())
+                          .arg(referenceMap_ ? "参考地图点" : "累积点")
+                          .arg(mapPoints_.size()));
   if (mapBadge_)
     mapBadge_->setText(
-        QString("当前任务 · %1 个航点\n任务航线 / EGO 规划 / 实际轨迹")
-            .arg(mission_.waypoints_size()));
+        QString("本地 %1 个 · 任务机 %2 个航点\n本地航线 / 机载航点 / EGO 规划")
+            .arg(mission_.waypoints_size()).arg(remotePoints_.size()));
   if (window_)
     window_->statusBar()->showMessage("地图坐标：" + frame_ + "　·　单位：m");
 }
 void MissionController::refreshRouteStrip() {
   if (!routeStrip_ || !routeSummary_)
     return;
-  const int count = mission_.waypoints_size();
+  const int localCount = mission_.waypoints_size();
+  const int remoteCount = remotePoints_.size();
+  const int count = localCount + remoteCount;
   const int selected = waypoints_ ? waypoints_->currentRow() : -1;
-  routeSummary_->setText(QString("%1 个航点 · %2")
-                             .arg(count)
-                             .arg(selected >= 0 ? QString("当前 P%1").arg(selected + 1)
-                                                : "本地编排"));
+  routeSummary_->setText(QString("%1 个 · 本地 %2 / 机载 %3")
+                             .arg(count).arg(localCount).arg(remoteCount));
   auto *strip = qobject_cast<QHBoxLayout *>(routeStrip_->layout());
   while (auto *item = strip->takeAt(0)) {
-    if (auto *widget = item->widget())
+    if (auto *widget = item->widget()) {
+      widget->hide();
       widget->deleteLater();
+    }
     delete item;
   }
   if (count == 0) {
-    auto *empty = new QLabel("暂无航点 · 点击顶部“添加航点”开始编排", routeStrip_);
+    auto *empty = new QLabel("暂无航点 · 点击查看打开弹窗", routeStrip_);
     empty->setObjectName("mutedText");
     strip->addWidget(empty);
     strip->addStretch();
     return;
   }
-  constexpr int kVisible = 7;
-  const int first = qBound(0, selected - 3, qMax(0, count - kVisible));
+  constexpr int kVisible = 4;
+  const int first = qBound(0, selected - 1, qMax(0, count - kVisible));
   const int last = qMin(count, first + kVisible);
   if (first > 0)
     strip->addWidget(new QLabel("…", routeStrip_));
   for (int i = first; i < last; ++i) {
-    if (i > first) {
-      auto *connector = new QLabel("──", routeStrip_);
-      connector->setObjectName("routeConnector");
-      strip->addWidget(connector);
-    }
-    auto *chip = new QPushButton(QString("P%1").arg(i + 1), routeStrip_);
+    const bool local = i < localCount;
+    auto *chip = new QPushButton(
+        QString("%1%2").arg(local ? "本" : "机")
+            .arg(local ? i + 1 : i - localCount + 1), routeStrip_);
     chip->setObjectName("routeChip");
     chip->setCheckable(true);
     chip->setChecked(i == selected);
-    chip->setToolTip(QString("选中航点 P%1").arg(i + 1));
+    chip->setToolTip(local ? QString("本地航点 %1 · 可编辑").arg(i + 1)
+                           : QString("机载航点 %1 · 只读").arg(i - localCount + 1));
     strip->addWidget(chip);
-    connect(chip, &QPushButton::clicked, this,
-            [this, i] { waypoints_->selectRow(i); });
+    connect(chip, &QPushButton::clicked, this, [this, i] {
+      waypoints_->selectRow(i);
+      setEditorCollapsed(false);
+    });
   }
   if (last < count)
     strip->addWidget(new QLabel(QString("… +%1").arg(count - last), routeStrip_));
   strip->addStretch();
 }
 void MissionController::setEditorCollapsed(bool collapsed) {
-  if (!editor_ || !routeDetails_ || !routeStrip_)
+  if (!editor_ || !routeDialog_ || !routeStrip_)
     return;
   editorCollapsed_ = collapsed;
-  routeDetails_->setVisible(!collapsed);
-  routeStrip_->setVisible(collapsed);
-  routeFold_->setText(collapsed ? "展开 ▾" : "折叠 ▴");
-  routeFold_->setAccessibleName(collapsed ? "展开航点任务" : "折叠航点任务");
-  arrange();
+  routeFold_->setText(collapsed ? "查看 ↗" : "关闭 ×");
+  routeFold_->setAccessibleName(collapsed ? "查看航点任务弹窗" : "关闭航点任务弹窗");
+  if (collapsed) {
+    routeDialog_->hide();
+  } else {
+    if (!routeDialog_->isVisible())
+      routeDialog_->move(window_->frameGeometry().center() -
+                         QPoint(routeDialog_->width() / 2,
+                                routeDialog_->height() / 2));
+    routeDialog_->show();
+    routeDialog_->raise();
+    routeDialog_->activateWindow();
+  }
   updateWaypointGizmo();
+}
+void MissionController::setToolbarCollapsed(bool collapsed) {
+  if (!top_ || !toolbarContents_ || !toolbarFold_)
+    return;
+  toolbarCollapsed_ = collapsed;
+  toolbarContents_->setVisible(!collapsed);
+  toolbarFold_->setText(collapsed ? "▶" : "◀");
+  toolbarFold_->setToolTip(collapsed ? "展开工具栏" : "向左收起工具栏");
+  toolbarFold_->setAccessibleName(collapsed ? "展开工具栏" : "向左收起工具栏");
+  arrange();
 }
 void MissionController::arrange() {
   if (!canvas_)
@@ -1111,11 +1242,10 @@ void MissionController::arrange() {
                            mapPopover_->sizeHint().height());
   right_->setGeometry(w - rightWidth - margin, margin, rightWidth,
                       right_->sizeHint().height());
-  top_->setGeometry(centerX, margin, centerWidth, 46);
+  top_->setGeometry(centerX, margin, toolbarCollapsed_ ? 44 : centerWidth, 46);
   mapBadge_->setGeometry(centerX + 2, margin + 56, qMin(268, centerWidth / 2),
                          51);
-  const int editorWidth = editorCollapsed_ ? qMin(500, centerWidth - 4)
-                                           : centerWidth - 4;
+  const int editorWidth = qMin(440, centerWidth - 4);
   const int editorHeight = qMin(h - margin * 2, editor_->sizeHint().height());
   const int editorX = centerX + (centerWidth - editorWidth) / 2;
   const int editorY = h - editorHeight - margin;
@@ -1321,7 +1451,9 @@ void MissionController::expireGrid() {
 }
 void MissionController::makeVoxelGrid() {
   grid_->removeAllChildren();
-  if (gridCenters_.isEmpty())
+  // An alpha-zero mesh can still write to the depth buffer and hide other
+  // layers, so skip its geometry entirely.
+  if (gridCenters_.isEmpty() || gridOpacity_ <= 0.0)
     return;
   auto *vertices = new ccPointCloud("EGO voxel vertices");
   auto *mesh = new ccMesh(vertices);
@@ -1335,6 +1467,7 @@ void MissionController::makeVoxelGrid() {
     return;
   }
   const float half = float(gridResolution_ * .40); // Visual gaps reveal cells over dense clouds.
+  const auto alpha = static_cast<unsigned char>(std::lround(gridOpacity_ * 255.0));
   static const unsigned faces[12][3] = {
       {0, 2, 3}, {0, 3, 1}, {4, 5, 7}, {4, 7, 6},
       {0, 1, 5}, {0, 5, 4}, {2, 6, 7}, {2, 7, 3},
@@ -1345,7 +1478,8 @@ void MissionController::makeVoxelGrid() {
       vertices->addPoint(CCVector3(p.x() + ((corner & 1) ? half : -half),
                                   p.y() + ((corner & 2) ? half : -half),
                                   p.z() + ((corner & 4) ? half : -half)));
-      vertices->addColor(235, 169, 86);
+      vertices->addColor(gridColor_.red(), gridColor_.green(),
+                         gridColor_.blue(), alpha);
     }
     for (const auto &f : faces)
       mesh->addTriangle(i * 8 + f[0], i * 8 + f[1], i * 8 + f[2]);
@@ -1361,7 +1495,10 @@ void MissionController::updateScene() {
   if (!gl_ || !dirty_)
     return;
   dirty_ = false;
-  makeCloud(live_, livePoints_);
+  if (liveDirty_) {
+    makeCloud(live_, livePoints_);
+    liveDirty_ = false;
+  }
   if (mapDirty_) {
     makeCloud(map_, mapPoints_);
     mapDirty_ = false;
@@ -1370,28 +1507,47 @@ void MissionController::updateScene() {
     makeVoxelGrid();
     gridDirty_ = false;
   }
-  makeLine(trail_, history_, 230, 238, 242, 2);
-  makeLine(ego_, egoPoints_, 56, 224, 211, 3);
+  if (trailDirty_) {
+    makeLine(trail_, history_, 255, 0, 0, 2);
+    trailDirty_ = false;
+  }
+  if (egoDirty_) {
+    makeLine(ego_, egoPoints_, 56, 224, 211, 3);
+    egoDirty_ = false;
+  }
+  gl_->redraw();
+}
+void MissionController::updateAircraftPose() {
+  if (!gl_)
+    return;
+  if (aircraftModel_)
+    aircraftModel_->setVisible(lastVehicle_.pose_valid());
   if (lastVehicle_.pose_valid()) {
     const auto p = vec(lastVehicle_.position());
     const auto &q = lastVehicle_.orientation();
-    QQuaternion rot(q.w(), q.x(), q.y(), q.z());
-    QVector<QVector3D> a;
-    for (auto d : QVector<QVector3D>{{-.45f, -.45f, 0},
-                                     {.45f, .45f, 0},
-                                     {0, 0, 0},
-                                     {-.45f, .45f, 0},
-                                     {.45f, -.45f, 0},
-                                     {0, 0, 0},
-                                     {1, 0, 0},
-                                     {.6f, .2f, 0},
-                                     {1, 0, 0},
-                                     {.6f, -.2f, 0}})
-      a << p + rot.rotatedVector(d);
-    makeLine(aircraft_, a, 255, 213, 100, 3);
+    // Keep local geometry immutable: absolute body-to-map transform each frame.
+    // Normalization also tolerates the protocol's small quaternion norm error.
+    QMatrix4x4 transform;
+    transform.translate(p);
+    transform.rotate(QQuaternion(q.w(), q.x(), q.y(), q.z()).normalized());
+    if (aircraftModel_)
+      aircraftModel_->setGLTransformation(ccGLMatrix(transform.constData()));
     if (follow_->isChecked())
       gl_->setPivotPoint(CCVector3d(p.x(), p.y(), p.z()));
   }
+}
+void MissionController::focusAircraft() {
+  if (!gl_ || !lastVehicle_.pose_valid()) {
+    log("当前没有有效的无人机位置");
+    return;
+  }
+  const auto p = vec(lastVehicle_.position());
+  const CCVector3 center(p.x(), p.y(), p.z());
+  const CCVector3 margin(.55f, .55f, .55f);
+  ccBBox bounds;
+  bounds.add(center - margin);
+  bounds.add(center + margin);
+  gl_->updateConstellationCenterAndZoom(&bounds);
   gl_->redraw();
 }
 void MissionController::updateWaypointGizmo() {

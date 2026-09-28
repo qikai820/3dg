@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/mission3dg/x500">
+    <file alias="quadrotor.mesh">assets/x500/quadrotor.mesh</file>
+    <file alias="LICENSE">assets/x500/LICENSE</file>
+  </qresource>
+</RCC>

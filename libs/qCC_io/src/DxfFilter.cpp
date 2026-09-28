@@ -742,7 +742,7 @@ CC_FILE_ERROR DxfFilter::saveToFile(ccHObject* root, const QString& filename, co
 	double pageMargin = baseSize / 20.0;
 
 	DL_Dxf dxf;
-#ifdef _WIN32
+#ifdef _MSC_VER
 	DL_WriterA* dw = dxf.out(filename.toStdWString(), DL_VERSION_R12);
 #else
 	if (CheckForSpecialChars(filename))
@@ -1029,7 +1029,7 @@ CC_FILE_ERROR DxfFilter::loadFile(const QString& filename, ccHObject& container,
 	{
 		DxfImporter importer(&container, parameters);
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 		if (DL_Dxf().in(filename.toStdWString(), &importer))
 #else
 		if (CheckForSpecialChars(filename))

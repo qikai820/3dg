@@ -36,7 +36,7 @@ YamlSettingsPanel::YamlSettingsPanel(ProtocolClient *client, QWidget *parent)
     : QWidget(parent), client_(client) {
   auto *layout = new QVBoxLayout(this);
   auto *hint = new QLabel(
-      "参数来自任务机 YAML。保存后重启对应进程生效；航点请在航点编辑器中管理。", this);
+      "参数来自任务机 YAML。保存后重启对应进程生效；机载航点只读显示，本地航点可在编辑器编排后上传。", this);
   hint->setWordWrap(true);
   layout->addWidget(hint);
   search_ = new QLineEdit(this);

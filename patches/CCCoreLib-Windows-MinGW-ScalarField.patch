@@ -1,0 +1,26 @@
+diff --git a/include/ScalarField.h b/include/ScalarField.h
+index 77306a9..afb6912 100644
+--- a/include/ScalarField.h
++++ b/include/ScalarField.h
+@@ -87,7 +87,7 @@ namespace CCCoreLib
+ 		//! Default destructor
+ 		/** Call release instead.
+ 		**/
+-		CC_CORE_LIB_API ~ScalarField() override = default;
++		CC_CORE_LIB_API ~ScalarField() override;
+ 
+ 	protected: //members
+ 
+diff --git a/src/ScalarField.cpp b/src/ScalarField.cpp
+index 3432c98..3d1ab21 100644
+--- a/src/ScalarField.cpp
++++ b/src/ScalarField.cpp
+@@ -20,6 +20,8 @@ ScalarField::ScalarField(const ScalarField& sf)
+ 	setName(sf.m_name);
+ }
+ 
++ScalarField::~ScalarField() = default;
++
+ void ScalarField::setName(const char* name)
+ {
+ 	if (name)

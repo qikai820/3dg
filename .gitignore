@@ -142,3 +142,4 @@ plugins/private
 /.deps/
 /artifacts/
 /build-local/
+/build-windows/

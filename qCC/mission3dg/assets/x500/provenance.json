@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/PX4/PX4-gazebo-models",
+  "revision": "5577035667afb4b63fe1f966fb1a58bbb05d905b",
+  "sources_sha256": {
+    "models/x500_base/model.sdf": "e807dca3406f7cd5cb3d545898601c3ec17e0e5242e25cf467a69df1812cf436",
+    "models/x500_base/meshes/NXP-HGD-CF.dae": "7321861b113866996dfa79b403def5666d4b796810840d2c057c7b51fc315b0a",
+    "models/x500_base/meshes/5010Base.dae": "798396a1945c7ff55a0840b77869e27affdd35fed0d784fff96b68f50f160ea0",
+    "models/x500_base/meshes/1345_prop_ccw.stl": "ba197e0961117a3462b555d65edf3433ba8ff5691624100a185242cb5f456244",
+    "models/x500_base/meshes/5010Bell.dae": "b90a1b2dd63a8ebbe1f3339ed18cef23673e0d8f03314fd9b9533a68b6b66668",
+    "models/x500_base/meshes/1345_prop_cw.stl": "7aa4b61c1ddc5304c9c1f5602eacf5e2ec5eafb95dd1f2a3368342f256122fc0",
+    "LICENSE": "5fcb2a52fc0390cc8c7eccaa0cde9316c810f38811efb357e1ede7858e26e289"
+  },
+  "original_triangles": 251556,
+  "vertices": 30142,
+  "triangles": 59976,
+  "bounds_m": [
+    [
+      -0.20365040491782174,
+      -0.3203846153846154,
+      -0.22865653140760658
+    ],
+    [
+      0.20354018661797746,
+      0.3203845278299772,
+      0.05636277554748945
+    ]
+  ],
+  "output_sha256": "af6438e3f85140a5af21f8e1892683d39359503f00746df25bd3d869218ad640"
+}
