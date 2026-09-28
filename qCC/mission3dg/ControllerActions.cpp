@@ -1622,6 +1622,9 @@ void MissionController::smoke() {
                              workspaceMenu->actions().size() == 3 &&
                              !window_->menuBar()->actions().contains(
                                  workspaceActions_.value(static_cast<int>(Workspace::Monitor))));
+  checkWorkspace("menu_height", window_->menuBar()->height() <= 36 &&
+                                    latest_->height() <= window_->menuBar()->height() &&
+                                    latest_->y() >= 0);
   if (workspaceMenu) {
     workspaceMenu->popup(window_->menuBar()->mapToGlobal(
         QPoint(8, window_->menuBar()->height())));
@@ -1730,6 +1733,7 @@ void MissionController::smoke() {
                                     {"workspace_problems", workspaceProblems.join(",")},
                                     {"window_size", QString("%1x%2").arg(window_->width()).arg(window_->height())},
                                     {"canvas_size", QString("%1x%2").arg(canvas_->width()).arg(canvas_->height())},
+                                    {"menu_height", window_->menuBar()->height()},
                                     {"comparison_selected_count", comparisonSelectedCount},
                                     {"comparison_card_visible", comparisonCardVisible},
                                     {"comparison_roles_differ", comparisonRolesDiffer},

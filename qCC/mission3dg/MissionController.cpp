@@ -656,8 +656,8 @@ void MissionController::buildUi() {
       "efc9b7;}"
       "QPushButton#latestLog{background:rgba(255,255,255,226);border:1px solid "
       "#deebf0;"
-      "border-radius:8px;color:#2b4654;font-size:11px;min-height:25px;padding:"
-      "2px 10px;}"
+      "border-radius:7px;color:#2b4654;font-size:11px;padding:"
+      "1px 10px;}"
       "QCheckBox{color:#2d4655;spacing:7px;padding:5px 3px;}"
       "QCheckBox::indicator{width:11px;height:11px;border:1px solid #90a8b7;"
       "border-radius:6px;background:#f5fafc;}"
@@ -675,9 +675,9 @@ void MissionController::buildUi() {
       "QTableWidget{gridline-color:#e0eaf0;}"
       "QHeaderView::section{background:#e6eff4;color:#586f7d;border:0;padding:"
       "4px;}"
-      "QMenuBar{background:rgba(235,244,249,248);color:#344d5c;min-height:37px;"
+      "QMenuBar{background:rgba(235,244,249,248);color:#344d5c;"
       "}"
-      "QMenuBar::item{padding:7px 9px;margin:3px 1px;border-radius:6px;}"
+      "QMenuBar::item{padding:3px 8px;margin:1px 1px;border-radius:5px;}"
       "QMenuBar::item:selected{background:#d7e9ee;}"
       "QMenu{background:#f2f8fa;color:#304756;border:1px solid #c8d9e2;}"
       "QMenu::item:selected{background:#d5f1ea;}"
@@ -691,6 +691,7 @@ void MissionController::buildUi() {
       "QProgressBar::chunk{background:#54cbb3;border-radius:3px;}";
   window_->setStyleSheet(css);
   auto *bar = window_->menuBar();
+  bar->setFixedHeight(34);
   for (auto *a : bar->actions())
     a->setVisible(false);
   auto *missionMenu = bar->addMenu("3DG Mission ▾");
@@ -755,10 +756,10 @@ void MissionController::buildUi() {
   auto *settingsMenu = bar->addMenu("设置");
   settingsMenu->addAction("3DG 配置", this, &MissionController::settings);
   latest_ = new QPushButton("● 3DG 已就绪 ▾", bar);
-  latest_->setFixedSize(350, 30);
+  latest_->setFixedSize(350, 26);
   latest_->setObjectName("latestLog");
   bar->installEventFilter(this);
-  latest_->move(bar->width() - 360, 4);
+  latest_->move(bar->width() - 360, (bar->height() - latest_->height()) / 2);
   latest_->show();
   latest_->raise();
   logPopup_ = card(window_, "运行日志");
@@ -1623,7 +1624,8 @@ bool MissionController::eventFilter(QObject *o, QEvent *e) {
        e->type() == QEvent::MouseButtonRelease || e->type() == QEvent::Resize))
     QTimer::singleShot(0, this, [this] { updateWaypointGizmo(); });
   if (o == window_->menuBar() && e->type() == QEvent::Resize && latest_) {
-    latest_->move(qMax(500, window_->menuBar()->width() - 360), 4);
+    latest_->move(qMax(500, window_->menuBar()->width() - 360),
+                  (window_->menuBar()->height() - latest_->height()) / 2);
     latest_->raise();
   }
   if (o == video_ || o == videoWidget_) {
