@@ -2,6 +2,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -24,6 +25,14 @@ QString unescape(QString segment) {
 QString pointerHead(const QString &pointer) {
   return unescape(pointer.section('/', 1, 1));
 }
+QString parameterName(const QString &pointer) {
+  const QString key = unescape(pointer.section('/', -1));
+  bool isIndex = false;
+  key.toUInt(&isIndex);
+  if (isIndex && pointer.count('/') > 1)
+    return unescape(pointer.section('/', -2, -2)) + "[" + key + "]";
+  return key;
+}
 QString jsonScalar(const QJsonValue &value) {
   QJsonArray wrapper;
   wrapper.append(value);
@@ -36,7 +45,7 @@ YamlSettingsPanel::YamlSettingsPanel(ProtocolClient *client, QWidget *parent)
     : QWidget(parent), client_(client) {
   auto *layout = new QVBoxLayout(this);
   auto *hint = new QLabel(
-      "参数来自任务机 YAML。保存后重启对应进程生效；机载航点只读显示，本地航点可在编辑器编排后上传。", this);
+      "参数来自任务机配置；单击“说明”可查看完整内容，保存后的生效时间见底部提示。机载航点请在“航点任务”弹窗进入编辑模式后修改。", this);
   hint->setWordWrap(true);
   layout->addWidget(hint);
   search_ = new QLineEdit(this);
@@ -87,6 +96,15 @@ YamlSettingsPanel::YamlSettingsPanel(ProtocolClient *client, QWidget *parent)
   connect(save_, &QPushButton::clicked, this, [this] { save(); });
   connect(search_, &QLineEdit::textChanged, this,
           [this] { showGroup(currentGroup_); });
+  connect(table_, &QTableWidget::cellClicked, this, [this](int row, int column) {
+    if (column != 3)
+      return;
+    const auto *description = table_->item(row, 3);
+    const auto *name = table_->item(row, 0);
+    if (description && name)
+      QMessageBox::information(this, "参数说明 · " + name->text(),
+                               description->text());
+  });
   connect(tree_, &QTreeWidget::itemClicked, this,
           [this](QTreeWidgetItem *item) {
             const QString file = item->data(0, Qt::UserRole).toString();
@@ -232,7 +250,7 @@ void YamlSettingsPanel::setDocument(const mission::YamlDocument &document) {
     Field waypoints{"/waypoints", "航点",
                     QString("%1 项，使用航点编辑器修改")
                         .arg(content_.value("waypoints").toArray().size()),
-                    {}, false};
+                    definitions.value("/waypoints").toObject(), false};
     groups_["waypoints"].append(waypoints);
   }
   const auto labels = metadata_.value("groups").toObject();
@@ -253,8 +271,8 @@ void YamlSettingsPanel::setDocument(const mission::YamlDocument &document) {
   }
   currentGroup_ = groups_.isEmpty() ? QString() : groups_.cbegin().key();
   showGroup(currentGroup_);
-  status_->setText(QString::fromStdString(document.usage()) +
-                   " · 已读取，保存后重启对应进程生效");
+  status_->setText(QString::fromStdString(document.usage()) + " · 已读取，" +
+                   metadata_.value("apply").toString("保存后重启对应进程生效"));
 }
 
 QString YamlSettingsPanel::shown(const QJsonValue &value) const {
@@ -284,16 +302,18 @@ void YamlSettingsPanel::showGroup(const QString &group) {
       continue;
     const int row = table_->rowCount();
     table_->insertRow(row);
-    auto *name = new QTableWidgetItem(field.label);
+    auto *name = new QTableWidgetItem(parameterName(field.path));
     name->setToolTip(field.path);
     table_->setItem(row, 0, name);
     table_->setItem(row, 2,
                     new QTableWidgetItem(field.metadata.value("unit").toString()));
-    const QString note = field.editable
-                             ? field.metadata.value("description").toString(
-                                   "重启对应进程后生效")
-                             : "只读；使用专用流程修改或已停用";
-    table_->setItem(row, 3, new QTableWidgetItem(note));
+    QString note = field.metadata.value("description").toString(
+        field.editable ? "重启对应进程后生效" : "使用专用流程修改或已停用");
+    if (!field.editable)
+      note.prepend("只读；");
+    auto *description = new QTableWidgetItem(note);
+    description->setToolTip(note);
+    table_->setItem(row, 3, description);
     const auto current = drafts_.value(field.path, field.value);
     if (!field.editable || current.isNull() ||
         (!current.isString() && !current.isBool() && !current.isDouble())) {
@@ -326,7 +346,8 @@ void YamlSettingsPanel::showGroup(const QString &group) {
               [this, field](bool checked) { drafts_[field.path] = checked; });
       table_->setCellWidget(row, 1, check);
     } else {
-      auto *edit = new QLineEdit(shown(current), table_);
+      auto *container = current.isDouble() ? new QWidget(table_) : nullptr;
+      auto *edit = new QLineEdit(shown(current), container ? container : table_);
       connect(edit, &QLineEdit::textEdited, this,
               [this, field](const QString &text) {
                 if (field.value.isString())
@@ -340,7 +361,26 @@ void YamlSettingsPanel::showGroup(const QString &group) {
                     drafts_[field.path] = QJsonValue();
                 }
               });
-      table_->setCellWidget(row, 1, edit);
+      if (container) {
+        auto *inputLayout = new QHBoxLayout(container);
+        inputLayout->setContentsMargins(4, 0, 4, 0);
+        inputLayout->addWidget(edit);
+        inputLayout->addStretch();
+        auto fitWidth = [edit] {
+          QString sample = edit->text();
+          sample.append("00");
+          if (sample.size() < 4)
+            sample = "0000";
+          edit->setFixedWidth(qBound(64, edit->fontMetrics().horizontalAdvance(sample) + 16,
+                                     240));
+        };
+        connect(edit, &QLineEdit::textChanged, edit,
+                [fitWidth](const QString &) { fitWidth(); });
+        fitWidth();
+        table_->setCellWidget(row, 1, container);
+      } else {
+        table_->setCellWidget(row, 1, edit);
+      }
     }
   }
 }

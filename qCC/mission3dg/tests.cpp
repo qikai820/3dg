@@ -1,6 +1,7 @@
 #include "CloudIO.h"
 #include "ProtocolClient.h"
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QEventLoop>
 #include <QFile>
 #include <QTemporaryDir>
@@ -100,6 +101,17 @@ int main(int argc, char **argv) {
   CHECK(!ProtocolClient::validate(e).isEmpty());
   v->mutable_orientation()->set_w(1);
   CHECK(ProtocolClient::validate(e).isEmpty());
+  v->set_fcu_state_valid(true);
+  v->set_armed(true);
+  v->set_flight_mode("OFFBOARD");
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  mission::Envelope decoded;
+  CHECK(decoded.ParseFromString(e.SerializeAsString()));
+  CHECK(decoded.vehicle().fcu_state_valid() && decoded.vehicle().armed() &&
+        decoded.vehicle().flight_mode() == "OFFBOARD");
+  v->set_flight_mode("OFFBOARD\nspoofed");
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  v->set_flight_mode("OFFBOARD");
   v->mutable_position()->set_x(std::numeric_limits<double>::quiet_NaN());
   CHECK(!ProtocolClient::validate(e).isEmpty());
   ProtocolClient client;
@@ -126,6 +138,20 @@ int main(int argc, char **argv) {
   CHECK(!ProtocolClient::validate(e).isEmpty());
   grid->clear_centers();
   CHECK(ProtocolClient::validate(e).isEmpty()); // Empty snapshot clears grid.
+  grid->set_delta(true);
+  grid->set_base_version(1);
+  grid->set_version(2);
+  grid->add_added()->set_x(2);
+  grid->add_removed()->set_x(1);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  grid->set_base_version(2);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  grid->set_base_version(1);
+  grid->add_centers()->set_x(3);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  grid->clear_centers();
+  grid->mutable_added(0)->set_x(std::numeric_limits<double>::infinity());
+  CHECK(!ProtocolClient::validate(e).isEmpty());
   auto *yamlDocument = e.mutable_yaml_document();
   yamlDocument->set_id("ego");
   yamlDocument->set_revision(std::string(64, 'a'));
@@ -144,6 +170,21 @@ int main(int argc, char **argv) {
   CHECK(decodedPatch.ParseFromString(yamlPatch.SerializeAsString()));
   CHECK(decodedPatch.yaml_document_id() == "ego" &&
         decodedPatch.kind() == mission::Command::PATCH_YAML_DOCUMENT);
+  mission::Command odinStart;
+  odinStart.set_kind(mission::Command::START_ODIN);
+  odinStart.mutable_odin_start()->set_mode(mission::OdinStart::RELOCALIZATION);
+  odinStart.mutable_odin_start()->set_map_id(std::string(64, 'b'));
+  mission::Command decodedStart;
+  CHECK(decodedStart.ParseFromString(odinStart.SerializeAsString()));
+  CHECK(decodedStart.has_odin_start() &&
+        decodedStart.odin_start().mode() == mission::OdinStart::RELOCALIZATION);
+  auto *odinMap = e.mutable_odin_maps()->add_maps();
+  odinMap->set_id(std::string(64, 'b'));
+  odinMap->set_name("map_20260929.bin");
+  odinMap->set_size_bytes(1024);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  odinMap->set_id("invalid");
+  CHECK(!ProtocolClient::validate(e).isEmpty());
   int messages = 0;
   QObject::connect(&client, &ProtocolClient::message,
                    [&](const mission::Envelope &) { ++messages; });
@@ -151,8 +192,14 @@ int main(int argc, char **argv) {
   client.ingest(ProtocolClient::encode(e));
   CHECK(messages == 0);
   e.mutable_hello();
+  CHECK(!client.routeEditSupported());
+  CHECK(!client.routeDeleteSupported());
+  e.mutable_hello()->add_capabilities("route-edit-v1");
+  e.mutable_hello()->add_capabilities("route-delete-v1");
   client.ingest(ProtocolClient::encode(e));
   CHECK(messages == 1);
+  CHECK(client.routeEditSupported());
+  CHECK(client.routeDeleteSupported());
   CHECK(!client.connected());
   mission::Command offlineYaml;
   offlineYaml.set_kind(mission::Command::GET_YAML_CATALOG);
@@ -167,7 +214,24 @@ int main(int argc, char **argv) {
   e.set_sequence(3);
   client.ingest(ProtocolClient::encode(e));
   CHECK(messages == 2);
+  client.ingest(QByteArray(1, char(0xff)));
+  CHECK(client.receivedMessages() == 6 && client.invalidMessages() == 4);
+  if (client.receiveMbps() <= 0) {
+    QEventLoop rateLoop;
+    QObject::connect(&client, &ProtocolClient::linkStatsChanged, &rateLoop,
+                     [&] {
+                       if (client.receiveMbps() > 0)
+                         rateLoop.quit();
+                     });
+    QTimer::singleShot(2500, &rateLoop, &QEventLoop::quit);
+    rateLoop.exec();
+  }
+  CHECK(client.receiveMbps() > 0);
   client.stop();
+  CHECK(!client.routeEditSupported());
+  CHECK(!client.routeDeleteSupported());
+  CHECK(client.receivedMessages() == 0 && client.invalidMessages() == 0);
+  CHECK(client.receiveMbps() == 0 && client.transmitMbps() == 0);
   QWebSocketServer server("test", QWebSocketServer::NonSecureMode);
   CHECK(server.listen(QHostAddress::LocalHost, 0));
   int commands = 0, results = 0, clouds = 0, grids = 0, files = 0;
@@ -260,7 +324,7 @@ int main(int argc, char **argv) {
                      }
                      if (r.has_file())
                        ++files;
-                     if (results && clouds && grids && files)
+                     if (results && clouds && latestGridReceived && files)
                        loop.quit();
                    });
   client.open(QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
@@ -268,7 +332,7 @@ int main(int argc, char **argv) {
   loop.exec();
   CHECK(commands == 1 && results == 1);
   CHECK(clouds == 1 && files == 1);
-  CHECK(grids == 1 && latestGridReceived);
+  CHECK(grids == 2 && latestGridReceived);
   auto *file = e.mutable_file();
   file->set_total_size(5);
   file->set_offset(6);
@@ -281,6 +345,69 @@ int main(int argc, char **argv) {
   CHECK(!ProtocolClient::validate(e).isEmpty());
   client.stop();
   qDeleteAll(peers);
+  // Exercise automatic clock correction through the real WebSocket client.
+  QWebSocketServer timeServer("clock-test", QWebSocketServer::NonSecureMode);
+  CHECK(timeServer.listen(QHostAddress::LocalHost, 0));
+  QList<QWebSocket *> timePeers;
+  int probes = 0, syncs = 0;
+  bool targetCurrent = false;
+  qint64 clockOffsetMs = 20000;
+  quint64 timeSequence = 0;
+  QObject::connect(&timeServer, &QWebSocketServer::newConnection, [&] {
+    auto *peer = timeServer.nextPendingConnection();
+    timePeers << peer;
+    QObject::connect(peer, &QWebSocket::binaryMessageReceived,
+                     [&, peer](const QByteArray &b) {
+                       mission::Envelope request;
+                       if (!request.ParseFromArray(b.data(), b.size()) ||
+                           peer->requestUrl().path() != "/control")
+                         return;
+                       mission::Envelope reply;
+                       reply.set_protocol_version(1);
+                       reply.set_session_id("clock-server");
+                       reply.set_sequence(++timeSequence);
+                       reply.set_request_id(request.request_id());
+                       reply.set_time_domain("unix");
+                       reply.set_timestamp_ns(quint64(QDateTime::currentMSecsSinceEpoch() +
+                                                     clockOffsetMs) * 1000000);
+                       if (request.has_hello()) {
+                         reply.mutable_hello()->add_capabilities("time-sync-v1");
+                       } else if (request.has_command()) {
+                         reply.mutable_result()->set_state(
+                             mission::CommandResult::SUCCEEDED);
+                         if (request.command().kind() == mission::Command::GET_TIME)
+                           ++probes;
+                         if (request.command().kind() == mission::Command::SET_TIME) {
+                           ++syncs;
+                           targetCurrent = std::abs(qint64(request.command().unix_time_ns() /
+                                       1000000) - QDateTime::currentMSecsSinceEpoch()) < 2000;
+                           clockOffsetMs = 0;
+                         }
+                       } else {
+                         reply.mutable_heartbeat();
+                       }
+                       peer->sendBinaryMessage(ProtocolClient::encode(reply));
+                     });
+  });
+  ProtocolClient timeClient;
+  QEventLoop timeLoop;
+  QObject::connect(&timeClient, &ProtocolClient::diagnostic,
+                   [&](const QString &text) {
+                     if (text.contains("无需校时"))
+                       timeLoop.quit();
+                   });
+  timeClient.open(QUrl(QString("ws://127.0.0.1:%1").arg(timeServer.serverPort())));
+  QTimer::singleShot(3000, &timeLoop, &QEventLoop::quit);
+  timeLoop.exec();
+  CHECK(probes >= 2 && syncs == 1 && targetCurrent);
+  timeClient.stop();
+  clockOffsetMs = 5000;
+  timeClient.open(QUrl(QString("ws://127.0.0.1:%1").arg(timeServer.serverPort())));
+  QTimer::singleShot(3000, &timeLoop, &QEventLoop::quit);
+  timeLoop.exec();
+  CHECK(probes >= 3 && syncs == 1);
+  timeClient.stop();
+  qDeleteAll(timePeers);
   std::cout << checks
             << " checks passed (PCD ASCII/binary/LZF, malformed data, "
                "session/sequence, WebSocket control/cloud/files)\n";

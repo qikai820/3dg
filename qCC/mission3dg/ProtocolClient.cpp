@@ -2,6 +2,7 @@
 #include <QDateTime>
 #include <QNetworkProxy>
 #include <QUuid>
+#include <algorithm>
 #include <cmath>
 
 static bool finiteVec(const mission::Vec3 &p) {
@@ -21,10 +22,6 @@ ProtocolClient::ProtocolClient(QObject *parent)
   auto wire = [this](QWebSocket &socket, int channel) {
     connect(&socket, &QWebSocket::binaryMessageReceived, this,
             [this, channel](const QByteArray &b) {
-              if (b.size() > 8 * 1024 * 1024) {
-                Q_EMIT diagnostic("消息超过 8 MiB 限制");
-                return;
-              }
               ingest(b, channel);
             });
     connect(&socket,
@@ -41,6 +38,8 @@ ProtocolClient::ProtocolClient(QObject *parent)
   wire(cloud_, 1);
   wire(files_, 2);
   connect(&control_, &QWebSocket::connected, this, [this] {
+    resetLinkStats();
+    resetTimeSync();
     remoteSession_.clear();
     sequences_.clear();
     lastRx_.start();
@@ -49,14 +48,16 @@ ProtocolClient::ProtocolClient(QObject *parent)
     e.mutable_hello()->add_capabilities("xyzrgb-le16");
     e.mutable_hello()->add_capabilities("sampled-trajectory");
     e.mutable_hello()->add_capabilities("ego-voxel-grid-v1");
+    e.mutable_hello()->add_capabilities("ego-voxel-grid-delta-v1");
     e.mutable_hello()->add_capabilities("yaml-config-v1");
+    e.mutable_hello()->add_capabilities("odin-start-modes-v1");
     transmit(e);
     Q_EMIT stateChanged("已连接，等待协议握手", false);
   });
   connect(&control_, &QWebSocket::disconnected, this, [this] {
     ready_ = false;
+    resetTimeSync();
     latestCloud_.Clear();
-    latestGrid_.Clear();
     cloud_.abort();
     files_.abort();
     pending_.clear();
@@ -78,6 +79,10 @@ ProtocolClient::ProtocolClient(QObject *parent)
     mission::Envelope e;
     e.mutable_heartbeat();
     transmit(e);
+    if (ready_ && timeSyncSupported_ && timeProbeRequest_.isEmpty() &&
+        setTimeRequest_.isEmpty() &&
+        (!lastTimeProbe_.isValid() || lastTimeProbe_.elapsed() >= 60000))
+      probeTime();
     if (ready_) {
       QUrl u = base_;
       if (cloud_.state() == QAbstractSocket::UnconnectedState) {
@@ -91,8 +96,12 @@ ProtocolClient::ProtocolClient(QObject *parent)
     }
     const auto now = QDateTime::currentMSecsSinceEpoch();
     for (auto it = pending_.begin(); it != pending_.end();) {
-      if (now - it.value() > 30000) {
+      if (now > it.value()) {
         Q_EMIT diagnostic("命令超时（结果未知，不自动重发）: " + it.key());
+        if (it.key() == timeProbeRequest_)
+          timeProbeRequest_.clear();
+        if (it.key() == setTimeRequest_)
+          setTimeRequest_.clear();
         it = pending_.erase(it);
       } else
         ++it;
@@ -108,13 +117,23 @@ ProtocolClient::ProtocolClient(QObject *parent)
       e.Swap(&latestCloud_);
       Q_EMIT message(e);
     }
-    if (latestGrid_.has_grid()) {
-      mission::Envelope e;
-      e.Swap(&latestGrid_);
-      Q_EMIT message(e);
-    }
   });
   cloudDispatch_.start();
+  linkStatsTimer_.setInterval(1000);
+  connect(&linkStatsTimer_, &QTimer::timeout, this, [this] {
+    const qint64 elapsedMs = linkStatsAge_.restart();
+    if (elapsedMs <= 0)
+      return;
+    receiveMbps_ = double(receivedBytes_ - previousReceivedBytes_) * 8.0 /
+                   (double(elapsedMs) * 1000.0);
+    transmitMbps_ = double(transmittedBytes_ - previousTransmittedBytes_) * 8.0 /
+                    (double(elapsedMs) * 1000.0);
+    previousReceivedBytes_ = receivedBytes_;
+    previousTransmittedBytes_ = transmittedBytes_;
+    Q_EMIT linkStatsChanged();
+  });
+  linkStatsAge_.start();
+  linkStatsTimer_.start();
 }
 void ProtocolClient::open(const QUrl &url) {
   stop();
@@ -132,16 +151,27 @@ void ProtocolClient::connectSockets() {
 void ProtocolClient::stop() {
   desired_ = false;
   ready_ = false;
+  routeEditSupported_ = false;
+  routeDeleteSupported_ = false;
+  resetTimeSync();
   reconnect_.stop();
   latestCloud_.Clear();
-  latestGrid_.Clear();
   pending_.clear();
   control_.abort();
   cloud_.abort();
   files_.abort();
   remoteSession_.clear();
   sequences_.clear();
+  resetLinkStats();
   Q_EMIT stateChanged("未连接", false);
+}
+void ProtocolClient::resetLinkStats() {
+  receivedMessages_ = invalidMessages_ = 0;
+  receivedBytes_ = transmittedBytes_ = 0;
+  previousReceivedBytes_ = previousTransmittedBytes_ = 0;
+  receiveMbps_ = transmitMbps_ = 0;
+  linkStatsAge_.restart();
+  Q_EMIT linkStatsChanged();
 }
 QByteArray ProtocolClient::encode(const mission::Envelope &e) {
   const auto s = e.SerializeAsString();
@@ -153,7 +183,10 @@ void ProtocolClient::transmit(mission::Envelope e) {
   e.set_sequence(++sequence_);
   e.set_timestamp_ns(quint64(QDateTime::currentMSecsSinceEpoch()) * 1000000);
   e.set_time_domain("unix");
-  control_.sendBinaryMessage(encode(e));
+  const QByteArray bytes = encode(e);
+  const qint64 queued = control_.sendBinaryMessage(bytes);
+  if (queued > 0)
+    transmittedBytes_ += quint64(queued);
 }
 QString ProtocolClient::sendCommand(const mission::Command &command) {
   if (!connected() || control_.bytesToWrite() > 1024 * 1024) {
@@ -164,9 +197,89 @@ QString ProtocolClient::sendCommand(const mission::Command &command) {
   const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
   e.set_request_id(id.toStdString());
   *e.mutable_command() = command;
-  pending_[id] = QDateTime::currentMSecsSinceEpoch();
+  // START_EGO now waits for the real controller and setpoint stream. Its
+  // bounded device-side startup can take longer than the usual 30 seconds.
+  const qint64 timeoutMs = command.kind() == mission::Command::START_EGO
+                               ? 120000 : 30000;
+  pending_[id] = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
   transmit(e);
   return id;
+}
+void ProtocolClient::requestGridResync() {
+  // Reopening /cloud starts a new server-side delta stream with a full frame.
+  cloud_.abort();
+}
+void ProtocolClient::resetTimeSync() {
+  timeSyncSupported_ = false;
+  timeChecked_ = false;
+  timeProbeRequest_.clear();
+  setTimeRequest_.clear();
+  timeProbeAge_.invalidate();
+  lastTimeProbe_.invalidate();
+  lastTimeSync_.invalidate();
+}
+void ProtocolClient::probeTime() {
+  mission::Command command;
+  command.set_kind(mission::Command::GET_TIME);
+  timeProbeSentMs_ = QDateTime::currentMSecsSinceEpoch();
+  timeProbeAge_.start();
+  timeProbeRequest_ = sendCommand(command);
+  if (!timeProbeRequest_.isEmpty())
+    lastTimeProbe_.start();
+}
+void ProtocolClient::handleTimeResult(const mission::Envelope &e) {
+  if (e.result().state() == mission::CommandResult::ACCEPTED)
+    return;
+  const QString id = QString::fromStdString(e.request_id());
+  if (id == setTimeRequest_) {
+    setTimeRequest_.clear();
+    if (e.result().state() == mission::CommandResult::FAILED) {
+      Q_EMIT diagnostic("任务机校时失败：" + QString::fromStdString(e.result().detail()));
+    } else {
+      Q_EMIT diagnostic("任务机已执行校时，正在复查时间差");
+      lastTimeProbe_.invalidate();
+      probeTime();
+    }
+    return;
+  }
+  if (id != timeProbeRequest_)
+    return;
+  timeProbeRequest_.clear();
+  if (e.result().state() == mission::CommandResult::FAILED) {
+    Q_EMIT diagnostic("读取任务机时间失败：" + QString::fromStdString(e.result().detail()));
+    return;
+  }
+  const qint64 rttMs = timeProbeAge_.elapsed();
+  const qint64 remoteMs = qint64(e.timestamp_ns() / 1000000);
+  if (rttMs > 2000 || e.time_domain() != "unix" || remoteMs <= 0 ||
+      remoteMs >= 4102444800000LL) {
+    Q_EMIT diagnostic("时间测量延迟过大或任务机时间戳无效，本次不校时");
+    return;
+  }
+  const qint64 skewMs = remoteMs - (timeProbeSentMs_ + rttMs / 2);
+  if (qAbs(skewMs) < 10000) {
+    if (!timeChecked_ || lastTimeSync_.isValid())
+      Q_EMIT diagnostic(QString("任务机与 3DG 时间差约 %1 秒，无需校时")
+                            .arg(double(skewMs) / 1000, 0, 'f', 2));
+    timeChecked_ = true;
+    lastTimeSync_.invalidate();
+    return;
+  }
+  timeChecked_ = true;
+  if (lastTimeSync_.isValid() && lastTimeSync_.elapsed() < 60000) {
+    Q_EMIT diagnostic(QString("任务机与 3DG 仍相差约 %1 秒，稍后复查")
+                          .arg(double(skewMs) / 1000, 0, 'f', 2));
+    return;
+  }
+  mission::Command command;
+  command.set_kind(mission::Command::SET_TIME);
+  command.set_unix_time_ns(quint64(QDateTime::currentMSecsSinceEpoch()) * 1000000);
+  setTimeRequest_ = sendCommand(command);
+  if (!setTimeRequest_.isEmpty()) {
+    lastTimeSync_.start();
+    Q_EMIT diagnostic(QString("任务机与 3DG 相差约 %1 秒，已请求校时")
+                          .arg(double(skewMs) / 1000, 0, 'f', 2));
+  }
 }
 QString ProtocolClient::validate(const mission::Envelope &e) {
   if (e.protocol_version() != 1 || e.session_id().empty() ||
@@ -200,16 +313,31 @@ QString ProtocolClient::validate(const mission::Envelope &e) {
         (!std::isfinite(v.battery_percent()) || v.battery_percent() < 0 ||
          v.battery_percent() > 100))
       return "电量无效";
+    if (v.flight_mode().size() > 32 ||
+        std::any_of(v.flight_mode().begin(), v.flight_mode().end(),
+                    [](char ch) { return ch < 32 || ch > 126; }))
+      return "飞行模式无效";
   }
   if (e.has_grid()) {
     const auto &g = e.grid();
     if (g.frame_id().empty() || g.map_id().empty() ||
         !std::isfinite(g.resolution_m()) || g.resolution_m() < .02 ||
-        g.resolution_m() > 5 || g.centers_size() > 50000)
+        g.resolution_m() > 5 || g.centers_size() > 50000 ||
+        g.added_size() > 50000 || g.removed_size() > 50000 ||
+        (g.delta() ? (g.version() == 0 || g.base_version() == 0 ||
+                      g.version() <= g.base_version() || g.centers_size() != 0)
+                   : (g.base_version() != 0 || g.added_size() != 0 ||
+                      g.removed_size() != 0)))
       return "EGO 栅格坐标系、分辨率或数量无效";
     for (const auto &p : g.centers())
       if (!finiteVec(p))
         return "EGO 栅格包含无效坐标";
+    for (const auto &p : g.added())
+      if (!finiteVec(p))
+        return "EGO 栅格增量包含无效新增坐标";
+    for (const auto &p : g.removed())
+      if (!finiteVec(p))
+        return "EGO 栅格增量包含无效删除坐标";
   }
   if (e.has_trajectory()) {
     const auto &t = e.trajectory();
@@ -247,36 +375,61 @@ QString ProtocolClient::validate(const mission::Envelope &e) {
        e.yaml_document().metadata_json().size() > 256 * 1024 ||
        e.yaml_document().revision().size() != 64))
     return "YAML 配置内容或版本无效";
+  if (e.has_odin_maps()) {
+    if (e.odin_maps().maps_size() > 200)
+      return "Odin 地图列表过长";
+    for (const auto &map : e.odin_maps().maps())
+      if (map.id().size() != 64 || map.name().empty() ||
+          map.name().size() > 256 || map.size_bytes() == 0)
+        return "Odin 地图条目无效";
+  }
   return {};
 }
 void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
-  if (bytes.size() > 8 * 1024 * 1024)
+  ++receivedMessages_;
+  receivedBytes_ += quint64(bytes.size());
+  if (bytes.size() > 8 * 1024 * 1024) {
+    ++invalidMessages_;
+    Q_EMIT diagnostic("消息超过 8 MiB 限制");
     return;
+  }
   mission::Envelope e;
   if (!e.ParseFromArray(bytes.constData(), bytes.size())) {
+    ++invalidMessages_;
     Q_EMIT diagnostic("无法解析 Protobuf 消息");
     return;
   }
   const auto error = validate(e);
   if (!error.isEmpty()) {
+    ++invalidMessages_;
     Q_EMIT diagnostic(error);
     return;
   }
   if ((channel == 1 && !e.has_cloud() && !e.has_grid()) ||
       (channel == 2 && !e.has_file()) ||
       (channel == 0 && (e.has_cloud() || e.has_grid() || e.has_file()))) {
+    ++invalidMessages_;
     Q_EMIT diagnostic("消息与通道不匹配");
     return;
   }
   const QString session = QString::fromStdString(e.session_id());
   if (e.has_hello() && channel == 0) {
+    routeEditSupported_ = false;
+    routeDeleteSupported_ = false;
     if (session != remoteSession_) {
       remoteSession_ = session;
       sequences_.clear();
       latestCloud_.Clear();
-      latestGrid_.Clear();
+      resetTimeSync();
       Q_EMIT sessionChanged();
     }
+    for (const auto &capability : e.hello().capabilities())
+      if (capability == "time-sync-v1")
+        timeSyncSupported_ = true;
+      else if (capability == "route-edit-v1")
+        routeEditSupported_ = true;
+      else if (capability == "route-delete-v1")
+        routeDeleteSupported_ = true;
     ready_ = true;
     Q_EMIT stateChanged("任务机在线", true);
     QUrl u = base_;
@@ -289,11 +442,14 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
         files_.open(u);
     }
   } else if (session != remoteSession_ || !ready_) {
+    ++invalidMessages_;
     Q_EMIT diagnostic("未握手或会话不匹配，消息已丢弃");
     return;
   }
-  if (e.sequence() <= sequences_.value(channel))
+  if (e.sequence() <= sequences_.value(channel)) {
+    ++invalidMessages_;
     return;
+  }
   sequences_[channel] = e.sequence();
   if (channel == 0)
     lastRx_.restart();
@@ -303,13 +459,20 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
       return;
     if (e.result().state() != mission::CommandResult::ACCEPTED)
       pending_.remove(id);
+    if (id == timeProbeRequest_ || id == setTimeRequest_) {
+      handleTimeResult(e);
+      return;
+    }
   }
   if (channel == 1 && desired_) {
+    // Deltas are ordered state transitions; coalescing here would lose removals.
     if (e.has_grid())
-      latestGrid_.Swap(&e);
+      Q_EMIT message(e);
     else
       latestCloud_.Swap(&e);
     return;
   }
   Q_EMIT message(e);
+  if (e.has_hello() && timeSyncSupported_ && desired_)
+    probeTime();
 }

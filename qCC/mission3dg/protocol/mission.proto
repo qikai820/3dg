@@ -7,17 +7,21 @@ message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quaternion { double x = 1; double y = 2; double z = 3; double w = 4; }
 message Hello { string name = 1; repeated string capabilities = 2; }
 message Heartbeat { uint64 uptime_ms = 1; }
+enum TaskMode { MODE_UNKNOWN = 0; REAL = 1; SIMULATION = 2; MODE_CONFLICT = 3; }
 message VehicleState {
   string frame_id = 1; string map_id = 2; Vec3 position = 3;
   Quaternion orientation = 4; Vec3 velocity = 5;
   bool pose_valid = 6; bool velocity_valid = 7;
   bool battery_valid = 8; double battery_percent = 9;
+  // From a fresh, connected /mavros/state sample. False for old agents.
+  bool fcu_state_valid = 10; bool armed = 11; string flight_mode = 12;
 }
 message CompanionStatus {
   string odin = 1; string ego = 2; string localization = 3;
   bool video_running = 4; bool recording = 5;
   double cloud_hz = 6; double network_mbps = 7;
   double cpu_percent = 8; double disk_free_gb = 9;
+  TaskMode task_mode = 10;
 }
 message CloudFrame {
   enum Layout { XYZ_RGB_LE16 = 0; }
@@ -31,6 +35,9 @@ message TrajectoryPoint { Vec3 position = 1; double time_from_start_s = 2; }
 message VoxelGrid {
   string frame_id = 1; string map_id = 2; double resolution_m = 3;
   repeated Vec3 centers = 4; bool inflated = 5;
+  // A delta applies only to base_version. A full snapshot has delta=false.
+  uint64 version = 6; uint64 base_version = 7; bool delta = 8;
+  repeated Vec3 added = 9; repeated Vec3 removed = 10;
 }
 message PlannerTrajectory {
   enum State { VALID = 0; FAILED = 1; CANCELLED = 2; }
@@ -38,7 +45,13 @@ message PlannerTrajectory {
   uint64 start_time_ns = 4; repeated TrajectoryPoint points = 5;
   State state = 6; string detail = 7;
 }
-message Waypoint { Vec3 position = 1; double yaw = 2; double speed = 3; double hold_s = 4; }
+message Waypoint {
+  Vec3 position = 1; double yaw = 2; double speed = 3;
+  double hold_s = 4; // dwell_time in the EGO YAML; only Detect/Land points may dwell.
+  string pointmode = 5; // Empty means legacy Pass_through.
+  double inspection_pitch_deg = 6;
+  optional double inspection_zoom_ratio = 7; // Absent means legacy default 1.0.
+}
 message MissionPlan {
   string mission_id = 1; string map_id = 2; string frame_id = 3;
   uint32 revision = 4; repeated Waypoint waypoints = 5;
@@ -47,10 +60,23 @@ message Command {
   enum Kind { UNSPECIFIED = 0; START_ODIN = 1; START_EGO = 2; END_MISSION = 3;
     VIDEO_START = 4; VIDEO_STOP = 5; RECORD_START = 6; RECORD_STOP = 7;
     SAVE_MAP = 8; GET_CONFIG = 9; SET_CONFIG = 10; UPLOAD_MISSION = 11; GET_FILE = 12;
-    GET_YAML_CATALOG = 13; GET_YAML_DOCUMENT = 14; PATCH_YAML_DOCUMENT = 15; }
+    GET_YAML_CATALOG = 13; GET_YAML_DOCUMENT = 14; PATCH_YAML_DOCUMENT = 15;
+    GET_ODIN_MAPS = 16; GET_TIME = 17; SET_TIME = 18; SET_TASK_MODE = 19; }
   Kind kind = 1; Config config = 2; MissionPlan mission = 3; string file_id = 4;
   string yaml_document_id = 5; string yaml_revision = 6; string yaml_patch_json = 7;
+  OdinStart odin_start = 8;
+  uint64 unix_time_ns = 9; // SET_TIME: 3DG computer's current Unix time.
+  TaskMode task_mode = 10; // SET_TASK_MODE: select the task-machine workflow.
 }
+message OdinStart {
+  enum Mode { ODOMETRY = 0; SLAM = 1; RELOCALIZATION = 2; }
+  Mode mode = 1; string map_id = 2;
+}
+message OdinMap {
+  string id = 1; string name = 2; uint64 size_bytes = 3;
+  uint64 modified_unix_ms = 4;
+}
+message OdinMapCatalog { repeated OdinMap maps = 1; }
 message CommandResult {
   enum State { ACCEPTED = 0; SUCCEEDED = 1; FAILED = 2; }
   State state = 1; string detail = 2;
@@ -85,5 +111,6 @@ message Envelope {
     VideoStreamInfo video = 20; FileChunk file = 21;
     VoxelGrid grid = 22;
     YamlCatalog yaml_catalog = 23; YamlDocument yaml_document = 24;
+    OdinMapCatalog odin_maps = 25;
   }
 }

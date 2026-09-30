@@ -35,5 +35,6 @@ else
 fi
 cmake -S "$project_dir" -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DOPTION_3DG=ON -DOPTION_BUILD_CCVIEWER=OFF \
+  -DPLUGIN_STANDARD_QPOISSON_RECON=ON \
   -DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON "${deps_args[@]}" "${linguist_args[@]}"
-cmake --build "$build_dir" --target CloudCompare QCORE_IO_PLUGIN mission3dg_tests -j "${BUILD_JOBS:-2}"
+cmake --build "$build_dir" --target CloudCompare QCORE_IO_PLUGIN QPOISSON_RECON_PLUGIN mission3dg_tests -j "${BUILD_JOBS:-2}"

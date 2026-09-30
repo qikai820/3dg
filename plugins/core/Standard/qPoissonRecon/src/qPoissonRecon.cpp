@@ -25,6 +25,7 @@
 #include <QInputDialog>
 #include <QMainWindow>
 #include <QProgressDialog>
+#include <QScopedValueRollback>
 #include <QtCore>
 #include <QtConcurrentRun>
 #include <QtGui>
@@ -35,6 +36,7 @@
 //qCC_db
 #include <ccPointCloud.h>
 #include <ccMesh.h>
+#include <ccOctree.h>
 #include <ccProgressDialog.h>
 #include <ccScalarField.h>
 
@@ -243,6 +245,8 @@ void qPoissonRecon::onNewSelection(const ccHObject::Container& selectedEntities)
 {
 	if (m_action)
 		m_action->setEnabled(selectedEntities.size()==1 && selectedEntities[0]->isA(CC_TYPES::POINT_CLOUD));
+	if (m_quickAction)
+		m_quickAction->setEnabled(selectedEntities.size()==1 && selectedEntities[0]->isA(CC_TYPES::POINT_CLOUD));
 }
 
 QList<QAction *> qPoissonRecon::getActions()
@@ -256,11 +260,20 @@ QList<QAction *> qPoissonRecon::getActions()
 		//connect signal
 		connect(m_action, &QAction::triggered, this, &qPoissonRecon::doAction);
 	}
+	if (!m_quickAction)
+	{
+		m_quickAction = new QAction(tr("Quick Poisson reconstruction"), this);
+		m_quickAction->setObjectName("actionQuickPoissonRecon");
+		m_quickAction->setToolTip(tr("Estimate missing normals and display a mesh with default Poisson settings"));
+		connect(m_quickAction, &QAction::triggered, this, &qPoissonRecon::doQuickAction);
+	}
 
-	return QList<QAction *>{ m_action };
+	return QList<QAction *>{ m_action, m_quickAction };
 }
 
 static PoissonReconLib::Parameters s_params;
+static PoissonReconLib::Parameters s_runParams;
+static bool s_running = false;
 static ccPointCloud* s_cloud = nullptr;
 static ccMesh* s_mesh = nullptr;
 static ccPointCloud* s_meshVertices = nullptr;
@@ -280,7 +293,7 @@ bool doReconstruct()
 	MeshWrapper<PointCoordinateType> meshWrapper(*s_mesh, *s_meshVertices, s_densitySF);
 	PointCloudWrapper<PointCoordinateType> cloudWrapper(*s_cloud);
 	
-	if (!PoissonReconLib::Reconstruct(s_params, cloudWrapper, meshWrapper) || meshWrapper.isInErrorState())
+	if (!PoissonReconLib::Reconstruct(s_runParams, cloudWrapper, meshWrapper) || meshWrapper.isInErrorState())
 	{
 		return false;
 	}
@@ -293,11 +306,27 @@ bool doReconstruct()
 
 void qPoissonRecon::doAction()
 {
+	reconstruct(false);
+}
+
+void qPoissonRecon::doQuickAction()
+{
+	reconstruct(true);
+}
+
+void qPoissonRecon::reconstruct(bool quick)
+{
 	assert(m_app);
 	if (!m_app)
 	{
 		return;
 	}
+	if (s_running)
+	{
+		m_app->dispToConsole("Poisson reconstruction is already running", ccMainAppInterface::WRN_CONSOLE_MESSAGE);
+		return;
+	}
+	QScopedValueRollback<bool> runningGuard(s_running, true);
 
 	//we need one point cloud
 	if (!m_app->haveOneSelection())
@@ -318,10 +347,25 @@ void qPoissonRecon::doAction()
 
 	//with normals!
 	ccPointCloud* pc = static_cast<ccPointCloud*>(ent);
+	if (quick && pc->size() < 100)
+	{
+		m_app->dispToConsole("Quick Poisson reconstruction needs at least 100 points", ccMainAppInterface::ERR_CONSOLE_MESSAGE);
+		return;
+	}
 	if (!pc->hasNormals())
 	{
-		m_app->dispToConsole("Cloud must have normals!", ccMainAppInterface::ERR_CONSOLE_MESSAGE);
-		return;
+		if (!quick)
+		{
+			m_app->dispToConsole("Cloud must have normals!", ccMainAppInterface::ERR_CONSOLE_MESSAGE);
+			return;
+		}
+		const PointCoordinateType radius = ccOctree::GuessNaiveRadius(pc);
+		if (radius <= 0 || !pc->computeNormalsWithOctree(CCCoreLib::LS, ccNormalVectors::UNDEFINED, radius)
+			|| !pc->orientNormalsWithMST())
+		{
+			m_app->dispToConsole("Automatic normal estimation failed", ccMainAppInterface::ERR_CONSOLE_MESSAGE);
+			return;
+		}
 	}
 
 	static unsigned s_lastEntityID = 0;
@@ -335,66 +379,77 @@ void qPoissonRecon::doAction()
 	
 	bool cloudHasColors = pc->hasColors();
 	PoissonReconParamDlg prpDlg(m_app->getMainWindow());
-	prpDlg.importColorsCheckBox->setVisible(cloudHasColors);
-	if (s_depthMode)
-		prpDlg.depthRadioButton->setChecked(true);
-	else
-		prpDlg.resolutionRadioButton->setChecked(true);
-
-	//init dialog with semi-persistent settings
-	prpDlg.depthSpinBox->setValue(s_params.depth);
-	prpDlg.resolutionDoubleSpinBox->setValue(s_defaultResolution);
-	prpDlg.samplesPerNodeSpinBox->setValue(s_params.samplesPerNode);
-	prpDlg.importColorsCheckBox->setChecked(s_params.withColors);
-	prpDlg.densityCheckBox->setChecked(s_params.density);
-	prpDlg.weightDoubleSpinBox->setValue(s_params.pointWeight);
-	prpDlg.threadSpinBox->setValue(s_params.threads);
-	prpDlg.linearFitCheckBox->setChecked(s_params.linearFit);
-	switch (s_params.boundary)
+	if (quick)
 	{
-	case PoissonReconLib::Parameters::FREE:
-		prpDlg.boundaryComboBox->setCurrentIndex(0);
-		break;
-	case PoissonReconLib::Parameters::DIRICHLET:
-		prpDlg.boundaryComboBox->setCurrentIndex(1);
-		break;
-	case PoissonReconLib::Parameters::NEUMANN:
-		prpDlg.boundaryComboBox->setCurrentIndex(2);
-		break;
-	default:
-		assert(false);
-		break;
+		s_runParams = PoissonReconLib::Parameters();
+		s_runParams.depth = 8;
+		s_runParams.density = true;
+		s_runParams.withColors = cloudHasColors;
 	}
-
-	if (!prpDlg.exec())
-		return;
-
-	//set parameters with dialog settings
-	s_depthMode = prpDlg.depthRadioButton->isChecked();
-	s_defaultResolution = prpDlg.resolutionDoubleSpinBox->value();
-	
-	s_params.depth = (s_depthMode ? prpDlg.depthSpinBox->value() : 0);
-	s_params.finestCellWidth = static_cast<float>(s_depthMode ? 0.0 : s_defaultResolution);
-	s_params.samplesPerNode = static_cast<float>(prpDlg.samplesPerNodeSpinBox->value());
-	s_params.withColors = prpDlg.importColorsCheckBox->isChecked();
-	s_params.density = prpDlg.densityCheckBox->isChecked();
-	s_params.pointWeight = static_cast<float>(prpDlg.weightDoubleSpinBox->value());
-	s_params.threads = prpDlg.threadSpinBox->value();
-	s_params.linearFit = prpDlg.linearFitCheckBox->isChecked();
-	switch (prpDlg.boundaryComboBox->currentIndex())
+	else
 	{
-	case 0:
-		s_params.boundary = PoissonReconLib::Parameters::FREE;
-		break;
-	case 1:
-		s_params.boundary = PoissonReconLib::Parameters::DIRICHLET;
-		break;
-	case 2:
-		s_params.boundary = PoissonReconLib::Parameters::NEUMANN;
-		break;
-	default:
-		assert(false);
-		break;
+		prpDlg.importColorsCheckBox->setVisible(cloudHasColors);
+		if (s_depthMode)
+			prpDlg.depthRadioButton->setChecked(true);
+		else
+			prpDlg.resolutionRadioButton->setChecked(true);
+
+		//init dialog with semi-persistent settings
+		prpDlg.depthSpinBox->setValue(s_params.depth);
+		prpDlg.resolutionDoubleSpinBox->setValue(s_defaultResolution);
+		prpDlg.samplesPerNodeSpinBox->setValue(s_params.samplesPerNode);
+		prpDlg.importColorsCheckBox->setChecked(s_params.withColors);
+		prpDlg.densityCheckBox->setChecked(s_params.density);
+		prpDlg.weightDoubleSpinBox->setValue(s_params.pointWeight);
+		prpDlg.threadSpinBox->setValue(s_params.threads);
+		prpDlg.linearFitCheckBox->setChecked(s_params.linearFit);
+		switch (s_params.boundary)
+		{
+		case PoissonReconLib::Parameters::FREE:
+			prpDlg.boundaryComboBox->setCurrentIndex(0);
+			break;
+		case PoissonReconLib::Parameters::DIRICHLET:
+			prpDlg.boundaryComboBox->setCurrentIndex(1);
+			break;
+		case PoissonReconLib::Parameters::NEUMANN:
+			prpDlg.boundaryComboBox->setCurrentIndex(2);
+			break;
+		default:
+			assert(false);
+			break;
+		}
+
+		if (!prpDlg.exec())
+			return;
+
+		//set parameters with dialog settings
+		s_depthMode = prpDlg.depthRadioButton->isChecked();
+		s_defaultResolution = prpDlg.resolutionDoubleSpinBox->value();
+	
+		s_params.depth = (s_depthMode ? prpDlg.depthSpinBox->value() : 0);
+		s_params.finestCellWidth = static_cast<float>(s_depthMode ? 0.0 : s_defaultResolution);
+		s_params.samplesPerNode = static_cast<float>(prpDlg.samplesPerNodeSpinBox->value());
+		s_params.withColors = prpDlg.importColorsCheckBox->isChecked();
+		s_params.density = prpDlg.densityCheckBox->isChecked();
+		s_params.pointWeight = static_cast<float>(prpDlg.weightDoubleSpinBox->value());
+		s_params.threads = prpDlg.threadSpinBox->value();
+		s_params.linearFit = prpDlg.linearFitCheckBox->isChecked();
+		switch (prpDlg.boundaryComboBox->currentIndex())
+		{
+		case 0:
+			s_params.boundary = PoissonReconLib::Parameters::FREE;
+			break;
+		case 1:
+			s_params.boundary = PoissonReconLib::Parameters::DIRICHLET;
+			break;
+		case 2:
+			s_params.boundary = PoissonReconLib::Parameters::NEUMANN;
+			break;
+		default:
+			assert(false);
+			break;
+		}
+		s_runParams = s_params;
 	}
 
 	/*** RECONSTRUCTION PROCESS ***/
@@ -412,7 +467,7 @@ void qPoissonRecon::doAction()
 	bool result = false;
 	{
 		//start message
-		m_app->dispToConsole(QString("[PoissonRecon] Job started (level %1 - %2 threads)").arg(s_params.depth).arg(s_params.threads), ccMainAppInterface::STD_CONSOLE_MESSAGE);
+		m_app->dispToConsole(QString("[PoissonRecon] Job started (level %1 - %2 threads)").arg(s_runParams.depth).arg(s_runParams.threads), ccMainAppInterface::STD_CONSOLE_MESSAGE);
 
 		//progress dialog (Qtconcurrent::run can't be canceled!)
 		QProgressDialog pDlg(tr("Initialization"), QString(), 0, 0, m_app->getMainWindow());
@@ -422,11 +477,11 @@ void qPoissonRecon::doAction()
 		//QApplication::processEvents();
 
 		QString progressLabel("Reconstruction in progress\n");
-		if (s_depthMode)
-			progressLabel += QString("level: %1").arg(s_params.depth);
+		if (quick || s_depthMode)
+			progressLabel += QString("level: %1").arg(s_runParams.depth);
 		else
-			progressLabel += QString("resolution: %1").arg(s_params.finestCellWidth);
-		progressLabel += QString(" [%1 thread(s)]").arg(s_params.threads);
+			progressLabel += QString("resolution: %1").arg(s_runParams.finestCellWidth);
+		progressLabel += QString(" [%1 thread(s)]").arg(s_runParams.threads);
 
 		pDlg.setLabelText(progressLabel);
 		QApplication::processEvents();
@@ -436,10 +491,7 @@ void qPoissonRecon::doAction()
 		s_mesh = newMesh;
 		s_meshVertices = newPC;
 
-		if (s_params.density)
-		{
-			s_densitySF = (densitySF = new ccScalarField("Density"));
-		}
+		s_densitySF = s_runParams.density ? (densitySF = new ccScalarField("Density")) : nullptr;
 
 		QFuture<bool> future = QtConcurrent::run(doReconstruct);
 
@@ -461,6 +513,7 @@ void qPoissonRecon::doAction()
 		s_cloud = nullptr;
 		s_mesh = nullptr;
 		s_meshVertices = nullptr;
+		s_densitySF = nullptr;
 
 		pDlg.hide();
 		QApplication::processEvents();
@@ -482,7 +535,7 @@ void qPoissonRecon::doAction()
 	//success message
 	m_app->dispToConsole(QString("[PoissonRecon] Job finished (%1 triangles, %2 vertices)").arg(newMesh->size()).arg(newPC->size()), ccMainAppInterface::STD_CONSOLE_MESSAGE);
 
-	newMesh->setName(QString("Mesh[%1] (level %2)").arg(pc->getName()).arg(s_params.depth));
+	newMesh->setName(QString("Mesh[%1] (level %2)").arg(pc->getName()).arg(s_runParams.depth));
 	newPC->setEnabled(false);
 	newMesh->setVisible(true);
 	newMesh->computeNormals(true);
@@ -502,6 +555,8 @@ void qPoissonRecon::doAction()
 		newPC->showSF(true);
 		newMesh->showColors(newPC->colorsShown());
 		newMesh->showSF(true);
+		if (quick)
+			newMesh->showSF(false); // Keep density available for inspection while displaying source colors.
 	}
 
 	//copy Global Shift & Scale information
@@ -511,6 +566,8 @@ void qPoissonRecon::doAction()
 	m_app->addToDB(newMesh);
 	m_app->setSelectedInDB(ent, false);
 	m_app->setSelectedInDB(newMesh, true);
+	if (quick)
+		pc->setVisible(false);
 
 	//currently selected entities parameters may have changed!
 	m_app->updateUI();

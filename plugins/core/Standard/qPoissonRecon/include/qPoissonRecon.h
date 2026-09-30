@@ -47,11 +47,14 @@ protected:
 
 	//! Slot called when associated ation is triggered
 	void doAction();
+	void doQuickAction();
+	void reconstruct(bool quick);
 
 protected:
 
 	//! Associated action
 	QAction* m_action;
+	QAction* m_quickAction = nullptr;
 
 };
 
