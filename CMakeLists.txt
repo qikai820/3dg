@@ -10,6 +10,13 @@ if ( ${CMAKE_CURRENT_BINARY_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR} )
 	endif()
 endif()
 
+# Android has a separate Qt 6 application that shares the 3DG protocol code.
+# The desktop CloudCompare build below still uses Qt 5 and its existing plugins.
+if( ANDROID )
+	add_subdirectory( android )
+	return()
+endif()
+
 # Add our cmake module path so we don't need relative paths for these
 list( APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/" )
 
