@@ -269,7 +269,7 @@ private:
   mission::MissionPlan mission_;
   mission::CompanionStatus lastStatus_;
   mission::VehicleState lastVehicle_;
-  QString baseUrl_ = "ws://127.0.0.1:8765", videoUrl_, frame_ = "odom",
+  QString baseUrl_ = "ws://192.168.144.50:8765", videoUrl_, frame_ = "odom",
           mapId_ = "local-map";
   QString connectionState_ = "未连接";
   QString videoUrlBeforeAgent_;
