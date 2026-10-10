@@ -50,6 +50,10 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts/windows")
     parser.add_argument("--objdump", default="x86_64-w64-mingw32-objdump")
     parser.add_argument("--lrelease", default="lrelease")
+    parser.add_argument("--mingw-runtime-dir", type=Path,
+                        default=Path("/usr/lib/gcc/x86_64-w64-mingw32/13-posix"))
+    parser.add_argument("--protobuf-license", type=Path,
+                        default=ROOT / ".deps/protobuf-3.21.12/LICENSE")
     args = parser.parse_args()
     build = args.build_dir.resolve()
     qt = args.qt_dir.resolve()
@@ -81,10 +85,10 @@ def main() -> int:
         for name in names:
             copy(qt / "plugins" / subdir / name, stage / "plugins" / subdir / name)
 
-    # Prefer the GCC 13 runtime used for this build over Qt's GCC 8 runtime.
+    # Prefer the selected MinGW runtime over the runtime bundled with Qt.
     search_dirs = [
         build / "libs", build / "plugins",
-        Path("/usr/lib/gcc/x86_64-w64-mingw32/13-posix"),
+        args.mingw_runtime_dir,
         Path("/usr/x86_64-w64-mingw32/lib"),
         qt / "bin",
     ]
@@ -130,7 +134,7 @@ def main() -> int:
     copy(Path("/usr/share/common-licenses/GPL-2"), stage / "licenses/GPL-2.txt")
     copy(Path("/usr/share/common-licenses/GPL-3"), stage / "licenses/GPL-3.txt")
     copy(Path("/usr/share/common-licenses/LGPL-3"), stage / "licenses/LGPL-3.txt")
-    copy(ROOT / ".deps/protobuf-3.21.12/LICENSE", stage / "licenses/PROTOBUF-LICENSE")
+    copy(args.protobuf_license, stage / "licenses/PROTOBUF-LICENSE")
     copy(ROOT / "qCC/mission3dg/assets/x500/LICENSE", stage / "licenses/PX4-X500-LICENSE")
     (stage / "licenses/THIRD_PARTY_NOTICES.txt").write_text(
         "Qt 5.15.2 (dynamic libraries): https://www.qt.io/\n"
