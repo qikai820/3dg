@@ -18,6 +18,7 @@
 #include <memory>
 #include <set>
 #include <tuple>
+#include <vector>
 class MainWindow;
 class ccGLWindowInterface;
 class ccHObject;
@@ -40,9 +41,12 @@ class QMenuBar;
 class QProgressBar;
 class QSlider;
 class QToolButton;
+class QTabWidget;
+class QScrollArea;
 class AttitudeWidget;
 class WaypointGizmo;
 class FlightReplayDialog;
+class BagReplayToolbar;
 struct FlightReplayFrame;
 class MissionController : public QObject, public ccPickingListener {
   Q_OBJECT
@@ -56,15 +60,24 @@ private:
   void buildUi();
   void placeLatestLogButton();
   void arrange();
-  enum class Workspace { Monitor, Processing, Comparison };
-  void setWorkspace(Workspace workspace, bool captureCurrentCloud = true);
+  bool selectCurrentCloud();
   void refreshProcessingObjects();
-  void selectComparisonPair();
+  QVector<ccHObject *> selectedProcessingObjects() const;
+  void showProcessingObjectMenu(const QPoint &position);
+  void copyProcessingObjects();
+  void pasteProcessingObjects();
+  void renameProcessingObject();
+  void deleteProcessingObjects();
+  bool selectComparisonPair();
   void importProcessingFiles();
   ccPointCloud *captureSceneCloud(const QString &name, bool visible = true);
   void snapshotMap();
   void quickReconstruct();
   void runCloudCompareAction(const char *objectName);
+  void configureNoiseDetection();
+  void detectCloudNoise();
+  void showCloudNoise(bool onlyNoise);
+  void restoreCloudNoiseView();
   void refreshMapInfo();
   void refreshLinkStats();
   void refreshStartupButtons();
@@ -89,6 +102,7 @@ private:
   void refreshHeightFilterRange();
   void refreshHeightFilterLabel();
   void resetSession();
+  void applyBagReplayStatus(const mission::ReplayStatus &);
   void loadMap();
   bool loadMapPath(const QString &);
   void saveMap();
@@ -135,6 +149,13 @@ private:
   void updateVehicle(const mission::VehicleState &);
   void setStatusCells(const QStringList &values);
   void updateAircraftPose();
+  void updateOdinSensorPose(const mission::OdinSensorPose &);
+  void updateOdinProjection(const mission::OdinProjection &);
+  void refreshOdinOverlayStatus();
+  void rebuildOdinGeometry();
+  void clearOdinOverlays();
+  void addOverlayLine(ccHObject *, const QVector<QVector3D> &,
+                      unsigned char, unsigned char, unsigned char, float = 2);
   void focusAircraft();
   bool frameMatches(const std::string &, const std::string &);
   void showVideo();
@@ -149,6 +170,8 @@ private:
             *route_ = nullptr, *remoteRoute_ = nullptr, *ego_ = nullptr,
             *grid_ = nullptr, *trail_ = nullptr,
             *aircraft_ = nullptr;
+  ccHObject *cameraFov_ = nullptr, *lidarFov_ = nullptr,
+            *imageProjection_ = nullptr, *aircraftInflation_ = nullptr;
   ccMesh *aircraftModel_ = nullptr; // Owned by aircraft_; mesh is loaded once.
   ccHObject *replay_ = nullptr, *replayTrail_ = nullptr,
             *replaySetpoints_ = nullptr, *replayGrid_ = nullptr,
@@ -161,18 +184,31 @@ private:
   QTimer demoTimer_, redraw_, staleTimer_, autosaveTimer_, videoRetry_;
   quint64 videoRetryFrameCount_ = 0;
   QElapsedTimer vehicleAge_, plannerAge_, statusAge_, mismatchAge_,
-      downloadAge_, gridAge_;
+      downloadAge_, gridAge_, sensorAge_, projectionAge_;
+  mission::OdinSensorPose lastSensorPose_;
+  QVector<MissionPoint> projectionPoints_;
   bool referenceMap_ = false;
   quint64 mapCloudVersion_ = 0, liveCloudVersion_ = 0;
   quint64 automaticCloudVersion_ = 0;
   unsigned automaticCloudId_ = 0;
   bool automaticCloudFromMap_ = false;
+  unsigned noiseSourceId_ = 0, noiseResultId_ = 0;
+  int noiseKnn_ = 6, noisePointSize_ = 6;
+  double noiseSigma_ = 1.0;
+  bool noiseViewActive_ = false;
+  QHash<unsigned, bool> noiseDbVisibility_;
+  QHash<ccHObject *, bool> noiseSceneVisibility_;
+  QAction *noiseOverlayAction_ = nullptr, *noiseOnlyAction_ = nullptr,
+          *noiseRestoreAction_ = nullptr;
   QFrame *left_ = nullptr, *right_ = nullptr, *top_ = nullptr,
          *editor_ = nullptr, *video_ = nullptr, *logPopup_ = nullptr,
          *mapPopover_ = nullptr, *objectsCard_ = nullptr,
-         *processingCard_ = nullptr, *processingToolbar_ = nullptr,
+         *processingCard_ = nullptr,
          *heightFilterPanel_ = nullptr;
   QWidget *processingOnly_ = nullptr, *comparisonOnly_ = nullptr;
+  QWidget *objectsContent_ = nullptr;
+  QTabWidget *toolsTabs_ = nullptr;
+  QScrollArea *detailsScroll_ = nullptr;
   QListWidget *processingObjects_ = nullptr;
   QComboBox *referenceObject_ = nullptr, *targetObject_ = nullptr;
   QLabel *processingHint_ = nullptr;
@@ -180,20 +216,30 @@ private:
          *heightRangeTop_ = nullptr, *heightRangeBottom_ = nullptr;
   QSlider *heightSlider_ = nullptr;
   QToolButton *heightFilterButton_ = nullptr;
+  QToolButton *objectsButton_ = nullptr;
+  QToolButton *objectsFold_ = nullptr;
+  QWidget *objectsResizeGrip_ = nullptr;
+  QSize objectsExpandedSize_{190, 360};
+  QSize objectsResizeStart_;
+  QPoint objectsResizePress_;
+  bool objectsResizing_ = false;
+  std::vector<std::unique_ptr<ccHObject>> objectClipboard_;
   QCheckBox *heightFilterEnabled_ = nullptr;
   double heightFilterMin_ = 0, heightFilterMax_ = 0,
          heightFilterCutoff_ = 0;
   bool heightFilterHasRange_ = false;
   QPoint heightFilterDrag_;
   bool heightFilterDragging_ = false, heightFilterPlaced_ = false;
-  Workspace workspace_ = Workspace::Monitor;
-  QHash<int, QAction *> workspaceActions_;
   QWidget *toolbarContents_ = nullptr;
+  BagReplayToolbar *bagReplayToolbar_ = nullptr;
   QPushButton *toolbarFold_ = nullptr;
   QWidget *routeDetails_ = nullptr, *routeStrip_ = nullptr;
   QDialog *routeDialog_ = nullptr;
   QPointer<QDialog> odinStartDialog_;
   QPointer<FlightReplayDialog> replayDialog_;
+  bool bagReplayActive_ = false;
+  mission::ReplayStatus::State bagReplayState_ = mission::ReplayStatus::LIVE;
+  quint64 bagReplayEpoch_ = 0;
   QPointer<QButtonGroup> odinModeGroup_;
   QPointer<QListWidget> odinMapList_;
   QPointer<QLabel> odinMapHint_;
@@ -217,6 +263,7 @@ private:
   QPushButton *latest_ = nullptr;
   QPushButton *connectButton_ = nullptr;
   QAction *demoAction_ = nullptr, *settingsMenuAction_ = nullptr;
+  QHash<QObject *, QAction *> cardVisibilityActions_;
   QPushButton *logRecordButton_ = nullptr;
   QLabel *logRecordState_ = nullptr;
   QToolButton *mapDetailsButton_ = nullptr;
@@ -229,6 +276,9 @@ private:
   QTableWidget *waypoints_ = nullptr;
   QDoubleSpinBox *altitude_ = nullptr;
   QCheckBox *accumulate_ = nullptr, *follow_ = nullptr, *picking_ = nullptr;
+  QCheckBox *cameraFovToggle_ = nullptr, *lidarFovToggle_ = nullptr,
+            *projectionToggle_ = nullptr, *inflationToggle_ = nullptr;
+  QLabel *sensorOverlayStatus_ = nullptr;
   QMediaPlayer *player_ = nullptr;
   VideoCanvas *videoWidget_ = nullptr;
   AttitudeWidget *attitude_ = nullptr;
@@ -242,7 +292,6 @@ private:
   };
   QHash<int, MediaOperation> mediaOperations_;
   QHash<int, QString> mediaErrors_;
-  QHash<int, QLabel *> mediaStates_;
   QHash<QString, MissionPoint> voxels_, colorVoxels_;
   QVector<MissionPoint> mapPoints_, livePoints_, colorMapPoints_;
   QVector<QVector3D> history_, egoPoints_;

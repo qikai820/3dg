@@ -147,8 +147,8 @@ bool coordinate(const QJsonObject &row, QVector3D &point) {
 }
 
 FlightReplayDialog::FlightReplayDialog(const QUrl &taskSocket, Render render,
-                                       QWidget *parent)
-    : QDialog(parent), render_(std::move(render)) {
+                                       QWidget *parent, const QString &initialRecordId)
+    : QDialog(parent), render_(std::move(render)), initialRecordId_(initialRecordId) {
   setWindowTitle("飞行记录回放 · 历史数据");
   resize(470, 480);
   network_.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
@@ -364,7 +364,27 @@ void FlightReplayDialog::listRecords() {
         item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
     }
     status_->setText(records_->count() ? "请选择一条记录。" : "任务机还没有新格式的 3DG 飞行记录。");
+    if (!initialRecordId_.isEmpty()) {
+      const QString requested = initialRecordId_;
+      initialRecordId_.clear();
+      for (int i = 0; i < records_->count(); ++i) {
+        auto *item = records_->item(i);
+        if (item->data(Qt::UserRole).toString() == requested &&
+            (item->flags() & Qt::ItemIsEnabled)) {
+          records_->setCurrentItem(item);
+          loadRecord();
+          break;
+        }
+      }
+    }
   });
+}
+
+void FlightReplayDialog::selectRemoteRecord(const QString &recordId) {
+  if (!kId.match(recordId).hasMatch())
+    return;
+  initialRecordId_ = recordId;
+  listRecords();
 }
 
 void FlightReplayDialog::loadRecord() {

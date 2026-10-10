@@ -10,9 +10,10 @@ static bool finiteVec(const mission::Vec3 &p) {
          std::abs(p.x()) < 1e7 && std::abs(p.y()) < 1e7 &&
          std::abs(p.z()) < 1e7;
 }
-ProtocolClient::ProtocolClient(QObject *parent)
+ProtocolClient::ProtocolClient(QObject *parent, bool timeSyncEnabled)
     : QObject(parent),
-      localSession_(QUuid::createUuid().toString(QUuid::WithoutBraces)) {
+      localSession_(QUuid::createUuid().toString(QUuid::WithoutBraces)),
+      timeSyncEnabled_(timeSyncEnabled) {
   // The task-machine agent is a direct LAN peer; desktop HTTP proxies cannot
   // carry these WebSocket channels and may change the source address.
   const QNetworkProxy direct(QNetworkProxy::NoProxy);
@@ -51,6 +52,8 @@ ProtocolClient::ProtocolClient(QObject *parent)
     e.mutable_hello()->add_capabilities("ego-voxel-grid-delta-v1");
     e.mutable_hello()->add_capabilities("yaml-config-v1");
     e.mutable_hello()->add_capabilities("odin-start-modes-v1");
+    e.mutable_hello()->add_capabilities("bag-replay-v1");
+    e.mutable_hello()->add_capabilities("odin-projection-v1");
     transmit(e);
     Q_EMIT stateChanged("已连接，等待协议握手", false);
   });
@@ -58,6 +61,7 @@ ProtocolClient::ProtocolClient(QObject *parent)
     ready_ = false;
     resetTimeSync();
     latestCloud_.Clear();
+    latestProjection_.Clear();
     cloud_.abort();
     files_.abort();
     pending_.clear();
@@ -79,7 +83,7 @@ ProtocolClient::ProtocolClient(QObject *parent)
     mission::Envelope e;
     e.mutable_heartbeat();
     transmit(e);
-    if (ready_ && timeSyncSupported_ && timeProbeRequest_.isEmpty() &&
+    if (ready_ && timeSyncEnabled_ && timeSyncSupported_ && timeProbeRequest_.isEmpty() &&
         setTimeRequest_.isEmpty() &&
         (!lastTimeProbe_.isValid() || lastTimeProbe_.elapsed() >= 60000))
       probeTime();
@@ -115,6 +119,11 @@ ProtocolClient::ProtocolClient(QObject *parent)
     if (latestCloud_.has_cloud()) {
       mission::Envelope e;
       e.Swap(&latestCloud_);
+      Q_EMIT message(e);
+    }
+    if (latestProjection_.has_projection()) {
+      mission::Envelope e;
+      e.Swap(&latestProjection_);
       Q_EMIT message(e);
     }
   });
@@ -153,9 +162,12 @@ void ProtocolClient::stop() {
   ready_ = false;
   routeEditSupported_ = false;
   routeDeleteSupported_ = false;
+  bagReplaySupported_ = false;
+  odinProjectionSupported_ = false;
   resetTimeSync();
   reconnect_.stop();
   latestCloud_.Clear();
+  latestProjection_.Clear();
   pending_.clear();
   control_.abort();
   cloud_.abort();
@@ -199,8 +211,10 @@ QString ProtocolClient::sendCommand(const mission::Command &command) {
   *e.mutable_command() = command;
   // START_EGO now waits for the real controller and setpoint stream. Its
   // bounded device-side startup can take longer than the usual 30 seconds.
-  const qint64 timeoutMs = command.kind() == mission::Command::START_EGO
-                               ? 120000 : 30000;
+  const qint64 timeoutMs = command.kind() == mission::Command::REPLAY_START
+                               ? 300000
+                               : command.kind() == mission::Command::START_EGO
+                                     ? 120000 : 30000;
   pending_[id] = QDateTime::currentMSecsSinceEpoch() + timeoutMs;
   transmit(e);
   return id;
@@ -219,6 +233,8 @@ void ProtocolClient::resetTimeSync() {
   lastTimeSync_.invalidate();
 }
 void ProtocolClient::probeTime() {
+  if (!timeSyncEnabled_)
+    return;
   mission::Command command;
   command.set_kind(mission::Command::GET_TIME);
   timeProbeSentMs_ = QDateTime::currentMSecsSinceEpoch();
@@ -294,6 +310,39 @@ QString ProtocolClient::validate(const mission::Envelope &e) {
         c.point_count() > 300000 ||
         c.point_data().size() != quint64(c.point_count()) * 16)
       return "点云布局或长度无效";
+  }
+  if (e.has_projection()) {
+    const auto &p = e.projection();
+    if (p.frame_id().empty() || p.map_id().empty() || !p.capture_time_ns() ||
+        p.point_count() > 6000 ||
+        p.point_data().size() != quint64(p.point_count()) * 16 ||
+        !finiteVec(p.camera_position()) ||
+        !std::isfinite(p.camera_orientation().x()) ||
+        !std::isfinite(p.camera_orientation().y()) ||
+        !std::isfinite(p.camera_orientation().z()) ||
+        !std::isfinite(p.camera_orientation().w()) ||
+        std::abs(p.camera_orientation().x()*p.camera_orientation().x() +
+                 p.camera_orientation().y()*p.camera_orientation().y() +
+                 p.camera_orientation().z()*p.camera_orientation().z() +
+                 p.camera_orientation().w()*p.camera_orientation().w() - 1.0) > .02)
+      return "Odin 图像投影布局或时间戳无效";
+  }
+  if (e.has_sensor_pose()) {
+    const auto &s = e.sensor_pose();
+    auto validQuaternion = [](const mission::Quaternion &q) {
+      const double n = q.x()*q.x()+q.y()*q.y()+q.z()*q.z()+q.w()*q.w();
+      return std::isfinite(n) && std::abs(n - 1.0) <= .02;
+    };
+    if (s.frame_id().empty() || s.map_id().empty() || !s.sample_time_ns() ||
+        (s.camera_valid() && (!finiteVec(s.camera_position()) ||
+                              !validQuaternion(s.camera_orientation()))) ||
+        (s.lidar_valid() && (!finiteVec(s.lidar_position()) ||
+                             !validQuaternion(s.lidar_orientation()))) ||
+        (s.inflation_valid() &&
+         (!std::isfinite(s.inflation_m()) || s.inflation_m() <= 0 || s.inflation_m() > 5 ||
+          !std::isfinite(s.grid_resolution_m()) || s.grid_resolution_m() < .02 ||
+          s.grid_resolution_m() > 5)))
+      return "Odin 传感器位姿或膨胀参数无效";
   }
   if (e.has_vehicle()) {
     const auto &v = e.vehicle();
@@ -383,6 +432,18 @@ QString ProtocolClient::validate(const mission::Envelope &e) {
           map.name().size() > 256 || map.size_bytes() == 0)
         return "Odin 地图条目无效";
   }
+  if (e.has_replay_status()) {
+    const auto &r = e.replay_status();
+    if (!mission::ReplayStatus_State_IsValid(r.state()) ||
+        r.bag_id().size() > 80 || r.detail().size() > 256 ||
+        !std::isfinite(r.position_seconds()) ||
+        !std::isfinite(r.duration_seconds()) ||
+        !std::isfinite(r.speed()) ||
+        r.position_seconds() < 0 || r.duration_seconds() < 0 ||
+        r.position_seconds() > r.duration_seconds() + .1 ||
+        r.speed() < .25 || r.speed() > 4.0)
+      return "bag 回放状态无效";
+  }
   return {};
 }
 void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
@@ -405,9 +466,9 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
     Q_EMIT diagnostic(error);
     return;
   }
-  if ((channel == 1 && !e.has_cloud() && !e.has_grid()) ||
+  if ((channel == 1 && !e.has_cloud() && !e.has_grid() && !e.has_projection()) ||
       (channel == 2 && !e.has_file()) ||
-      (channel == 0 && (e.has_cloud() || e.has_grid() || e.has_file()))) {
+      (channel == 0 && (e.has_cloud() || e.has_grid() || e.has_projection() || e.has_file()))) {
     ++invalidMessages_;
     Q_EMIT diagnostic("消息与通道不匹配");
     return;
@@ -416,10 +477,13 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
   if (e.has_hello() && channel == 0) {
     routeEditSupported_ = false;
     routeDeleteSupported_ = false;
+    bagReplaySupported_ = false;
+    odinProjectionSupported_ = false;
     if (session != remoteSession_) {
       remoteSession_ = session;
       sequences_.clear();
       latestCloud_.Clear();
+      latestProjection_.Clear();
       resetTimeSync();
       Q_EMIT sessionChanged();
     }
@@ -430,6 +494,10 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
         routeEditSupported_ = true;
       else if (capability == "route-delete-v1")
         routeDeleteSupported_ = true;
+      else if (capability == "bag-replay-v1")
+        bagReplaySupported_ = true;
+      else if (capability == "odin-projection-v1")
+        odinProjectionSupported_ = true;
     ready_ = true;
     Q_EMIT stateChanged("任务机在线", true);
     QUrl u = base_;
@@ -468,11 +536,13 @@ void ProtocolClient::ingest(const QByteArray &bytes, int channel) {
     // Deltas are ordered state transitions; coalescing here would lose removals.
     if (e.has_grid())
       Q_EMIT message(e);
+    else if (e.has_projection())
+      latestProjection_.Swap(&e);
     else
       latestCloud_.Swap(&e);
     return;
   }
   Q_EMIT message(e);
-  if (e.has_hello() && timeSyncSupported_ && desired_)
+  if (e.has_hello() && timeSyncEnabled_ && timeSyncSupported_ && desired_)
     probeTime();
 }

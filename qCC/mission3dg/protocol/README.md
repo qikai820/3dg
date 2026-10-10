@@ -4,8 +4,8 @@
 
 | 路径 | 消息 |
 |---|---|
-| `/control` | Hello / Heartbeat / VehicleState / CompanionStatus / PlannerTrajectory / Command / CommandResult / Config / LogEntry / VideoStreamInfo |
-| `/cloud` | CloudFrame / VoxelGrid |
+| `/control` | Hello / Heartbeat / VehicleState / CompanionStatus / PlannerTrajectory / OdinSensorPose / Command / CommandResult / Config / LogEntry / VideoStreamInfo |
+| `/cloud` | CloudFrame / VoxelGrid / OdinProjection |
 | `/files` | FileChunk |
 
 1. 控制连接建立后 3DG 发 Hello。服务端返回 Hello，协议版本 1，非空 session_id、从 1 递增 sequence。之后客户端才打开 cloud/files；服务端三个通道使用同一个服务端 session_id。
@@ -40,6 +40,12 @@ timestamp_ns 默认 Unix 纳秒，time_domain=`unix`；其他时钟需显式标�
 `point_data` 每点 16 字节：小端 float32 x/y/z（12 字节）+ uint8 r/g/b/reserved（4 字节）；无填充、无首版压缩。长度必须等于 point_count*16，最多 300000 点/帧，单消息最多 8 MiB。非有限点被过滤。
 
 显示通道是可丢帧实时通道，客户端最多 10 Hz 派发并保留最新待显示帧。`snapshot=true` 表示替换当前累积地图（非分片快照）；false 表示把本帧并入体素地图。增量帧可能被丢弃，因此客户端累积不保证完整。可靠完整地图应通过 SAVE_MAP + GET_FILE 获取机载 PCD，而非依赖实时通道拼接。建议机载降采样后传输。
+
+### Odin1 视场、图像与等效膨胀区
+
+声明 `odin-projection-v1` 的客户端会收到带相机和激光雷达世界位姿的 `OdinSensorPose`，以及可选的 `OdinProjection`。相机四元数使用光学轴（+Z 前、+X 右、+Y 下），雷达使用 Odin FLU；雷达位姿来自采样时的 TF，相机位姿由 `odom → lidar` 与设备标定 `Tcl_0` 的逆矩阵合成。桌面绘制标称 RGB 129°×104°、雷达 120°×90° 三维视场。`OdinProjection` 使用与 CloudFrame 相同的 XYZRGB LE16 格式，每帧最多 6000 个点、单独可隐藏。点位来自真实世界坐标系点云，颜色来自捕获时间匹配的去畸变图像；每个图像小区域只保留近处点，避免把远处表面盖到近处表面。没有同步 TF、有效设备标定、图像或点云时不发送投影帧；旧投影会过期清除。
+
+`OdinSensorPose` 分别标记相机光学位姿、雷达 TF 是否有效；相机标定缺失不会阻止雷达和膨胀盒显示。膨胀距离及栅格分辨率优先读取 EGO 运行参数；EGO 未运行时读取当前选中的任务配置，并在卡片注明“配置值”。桌面在飞机位置绘制世界轴对齐的等效碰撞盒，其半边长是 `ceil(膨胀距离/栅格分辨率) × 栅格分辨率 + 半格`。EGO 算法实际膨胀的是障碍体素；该盒仅表示点机器人与障碍膨胀的等效范围，不修改规划或替代左侧真实的 EGO 占据栅格。参数不可用时不显示这个盒。四个图层开关与视频按钮位于同一张卡片；视频 RTSP 播放与带时间戳的投影数据来源不同。
 
 ## EGO 与人工航线
 

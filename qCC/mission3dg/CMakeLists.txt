@@ -8,7 +8,7 @@ protobuf_generate_cpp(MISSION_PROTO_SRC MISSION_PROTO_HDR mission3dg/protocol/mi
 qt5_add_resources(MISSION_MODEL_RESOURCES mission3dg/models.qrc)
 target_sources(CloudCompare PRIVATE mission3dg/QuadrotorModel.cpp ${MISSION_MODEL_RESOURCES})
 install(FILES mission3dg/assets/x500/LICENSE DESTINATION share/cloudcompare/licenses RENAME PX4-X500-LICENSE)
-target_sources(CloudCompare PRIVATE mission3dg/MissionController.cpp mission3dg/ControllerActions.cpp mission3dg/MissionController.h mission3dg/FlightReplayDialog.cpp mission3dg/FlightReplayDialog.h mission3dg/OdinDataManagerDialog.cpp mission3dg/OdinDataManagerDialog.h mission3dg/ProtocolClient.cpp mission3dg/ProtocolClient.h mission3dg/YamlSettingsPanel.cpp mission3dg/YamlSettingsPanel.h mission3dg/CloudIO.cpp mission3dg/CloudIO.h ${MISSION_PROTO_SRC} ${MISSION_PROTO_HDR})
+target_sources(CloudCompare PRIVATE mission3dg/MissionController.cpp mission3dg/ControllerActions.cpp mission3dg/MissionController.h mission3dg/FlightReplayDialog.cpp mission3dg/FlightReplayDialog.h mission3dg/OdinDataManagerDialog.cpp mission3dg/OdinDataManagerDialog.h mission3dg/BagReplayToolbar.cpp mission3dg/BagReplayToolbar.h mission3dg/ProtocolClient.cpp mission3dg/ProtocolClient.h mission3dg/YamlSettingsPanel.cpp mission3dg/YamlSettingsPanel.h mission3dg/CloudIO.cpp mission3dg/CloudIO.h ${MISSION_PROTO_SRC} ${MISSION_PROTO_HDR})
 target_include_directories(CloudCompare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mission3dg ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(CloudCompare Qt5::Network Qt5::WebSockets Qt5::Multimedia Qt5::MultimediaWidgets ${Protobuf_LIBRARIES})
 target_compile_definitions(CloudCompare PRIVATE THREEDG_ENABLED)

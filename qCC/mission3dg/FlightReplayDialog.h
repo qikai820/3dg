@@ -44,7 +44,9 @@ struct FlightReplayFrame {
 class FlightReplayDialog : public QDialog {
 public:
   using Render = std::function<void(const FlightReplayFrame &)>;
-  FlightReplayDialog(const QUrl &taskSocket, Render render, QWidget *parent = nullptr);
+  FlightReplayDialog(const QUrl &taskSocket, Render render, QWidget *parent = nullptr,
+                     const QString &initialRecordId = {});
+  void selectRemoteRecord(const QString &recordId);
 
 private:
   void request(const QString &path, std::function<void(const QJsonDocument &, const QString &)> done);
@@ -81,6 +83,7 @@ private:
   QPushButton *play_ = nullptr;
   QTimer timer_;
   QString recordId_;
+  QString initialRecordId_;
   QString downloadDir_;
   double startNs_ = 0;
   int durationMs_ = 0;

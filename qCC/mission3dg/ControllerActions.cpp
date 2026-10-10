@@ -497,12 +497,16 @@ bool MissionController::frameMatches(const std::string &f,
   return matches;
 }
 void MissionController::resetSession() {
+  bagReplayActive_ = false;
+  bagReplayState_ = mission::ReplayStatus::LIVE;
+  bagReplayEpoch_ = 0;
   livePoints_.clear();
   history_.clear();
   egoPoints_.clear();
   liveDirty_ = trailDirty_ = egoDirty_ = true;
   clearRemoteRoute();
   expireGrid();
+  clearOdinOverlays();
   lastVehicle_.Clear();
   vehicleAge_.invalidate();
   if (!replayDialog_ && hud_) {
@@ -527,7 +531,45 @@ void MissionController::resetSession() {
     aircraftModel_->setVisible(false);
   log("新会话：清除旧遥测和轨迹；当前地图保留，请核对地图 ID。");
 }
+void MissionController::applyBagReplayStatus(const mission::ReplayStatus &status) {
+  const bool active = status.state() != mission::ReplayStatus::LIVE;
+  if (status.epoch() != bagReplayEpoch_ || active != bagReplayActive_) {
+    livePoints_.clear();
+    history_.clear();
+    egoPoints_.clear();
+    lastVehicle_.Clear();
+    vehicleAge_.invalidate();
+    plannerAge_.invalidate();
+    expireGrid();
+    clearOdinOverlays();
+    liveDirty_ = trailDirty_ = egoDirty_ = dirty_ = true;
+    if (aircraftModel_)
+      aircraftModel_->setVisible(false);
+    if (!replayDialog_) {
+      hud_->setText(active ? "历史 bag 回放 · 等待定位\n飞控状态 未知"
+                           : "等待实时定位\n飞控状态 未知");
+    }
+  }
+  bagReplayEpoch_ = status.epoch();
+  bagReplayActive_ = active;
+  bagReplayState_ = status.state();
+  if (!replayDialog_)
+    mode_->setText(active ? QString("◷ bag 回放 · %1 · %2")
+                                .arg(QString::fromStdString(status.bag_id()),
+                                     status.state() == mission::ReplayStatus::PAUSED
+                                         ? "已暂停" :
+                                     status.state() == mission::ReplayStatus::ENDED
+                                         ? "已结束" : "历史数据")
+                          : (ready_ ? "● " + connectionState_
+                                    : "○ " + connectionState_));
+}
 void MissionController::receive(const mission::Envelope &e) {
+  // The control and cloud WebSockets can arrive in either order. Never fold a
+  // frame from the previous source (or a new source awaiting its status) into
+  // the current map and trajectory.
+  if ((e.has_vehicle() || e.has_cloud() || e.has_grid() || e.has_trajectory()) &&
+      e.source_epoch() != bagReplayEpoch_)
+    return;
   if (e.has_hello()) {
     odinModesSupported_ = false;
     taskModeSupported_ = false;
@@ -542,6 +584,8 @@ void MissionController::receive(const mission::Envelope &e) {
         odinMapList_->count() == 0)
       requestOdinMaps();
     refreshOdinStartDialog();
+  } else if (e.has_replay_status()) {
+    applyBagReplayStatus(e.replay_status());
   } else if (e.has_odin_maps()) {
     const QString request = QString::fromStdString(e.request_id());
     if (request == odinMapsRequest_ && odinMapList_ && odinMapHint_) {
@@ -566,6 +610,14 @@ void MissionController::receive(const mission::Envelope &e) {
   } else if (e.has_vehicle()) {
     if (frameMatches(e.vehicle().frame_id(), e.vehicle().map_id()))
       updateVehicle(e.vehicle());
+  } else if (e.has_sensor_pose()) {
+    if (frameMatches(e.sensor_pose().frame_id(), e.sensor_pose().map_id()) &&
+        !bagReplayActive_ && !replayDialog_)
+      updateOdinSensorPose(e.sensor_pose());
+  } else if (e.has_projection()) {
+    if (frameMatches(e.projection().frame_id(), e.projection().map_id()) &&
+        !bagReplayActive_ && !replayDialog_)
+      updateOdinProjection(e.projection());
   } else if (e.has_cloud()) {
     auto &c = e.cloud();
     if (!frameMatches(c.frame_id(), c.map_id()))
@@ -577,7 +629,7 @@ void MissionController::receive(const mission::Envelope &e) {
       log(err);
       return;
     }
-    if (accumulate_->isChecked()) {
+    if (accumulate_->isChecked() && !bagReplayActive_) {
       if (referenceMap_)
         mapPoints_.clear();
       referenceMap_ = false;
@@ -605,7 +657,8 @@ void MissionController::receive(const mission::Envelope &e) {
         mapDirty_ = true;
       }
     }
-    receiveColorCloud(livePoints_, c.snapshot());
+    if (!bagReplayActive_)
+      receiveColorCloud(livePoints_, c.snapshot());
     liveDirty_ = dirty_ = true;
     refreshMapInfo();
   } else if (e.has_grid()) {
@@ -684,11 +737,13 @@ void MissionController::receive(const mission::Envelope &e) {
     }
     refreshStartupButtons();
     auto &s = lastStatus_;
+    const bool localVideo = controlsLocalVideo();
     const double networkMbps = s.network_mbps();
     const QString networkRate = networkMbps >= 0.1
                                     ? QString("%1 Mbps").arg(networkMbps, 0, 'f', 1)
                                     : QString("%1 kbps").arg(networkMbps * 1000.0, 0, 'f', 1);
     setStatusCells({
+        bagReplayActive_ ? "任务机 bag 回放" :
         demo_ ? "任务机 演示" : !taskModeSupported_ ? "任务机 在线"
                              : taskMode_ == mission::REAL ? "任务机 实物"
                              : taskMode_ == mission::SIMULATION ? "任务机 仿真"
@@ -702,10 +757,10 @@ void MissionController::receive(const mission::Envelope &e) {
         QString("CPU %1%").arg(s.cpu_percent(), 0, 'f', 0),
         QString("磁盘 %1 GB").arg(s.disk_free_gb(), 0, 'f', 1),
         s.video_running() ? "视频 机载推流中"
-                          : localVideoPlaying() ? "视频 本机播放中"
-                          : localVideoRequested() ? "视频 本机连接中"
+                          : localVideo && localVideoPlaying() ? "视频 本机播放中"
+                          : localVideo && localVideoRequested() ? "视频 本机连接中"
                                                   : "视频 停止",
-        s.recording() ? "记录 记录中" : "记录 停止"});
+        s.recording() ? "bag 记录中" : "bag 已停止"});
   } else if (e.has_yaml_document()) {
     const QString request = QString::fromStdString(e.request_id());
     if ((request == remoteRouteRequest_ ||
@@ -909,7 +964,14 @@ bool MissionController::localVideoPlaying() const {
 bool MissionController::controlsLocalVideo() const {
   const bool fresh = (ready_ || demo_) && statusAge_.isValid() &&
                      statusAge_.elapsed() <= 3000;
-  return !(fresh && lastStatus_.video_running()) &&
+  const QUrl source = QUrl::fromUserInput(videoUrl_.trimmed());
+  const QUrl taskMachine = QUrl::fromUserInput(baseUrl_.trimmed());
+  // A saved task-machine stream needs VIDEO_START when its producer is stopped.
+  const bool onboardStream = fresh &&
+      source.scheme().compare("rtsp", Qt::CaseInsensitive) == 0 &&
+      source.host().compare(taskMachine.host(), Qt::CaseInsensitive) == 0 &&
+      source.port() == 18554 && source.path() == "/mission3dg";
+  return !onboardStream && !(fresh && lastStatus_.video_running()) &&
          (localVideoRequested() ||
           (!videoUrlFromAgent_ && !videoUrl_.trimmed().isEmpty()));
 }
@@ -927,38 +989,50 @@ void MissionController::refreshMediaButtons() {
     const bool video = start == mission::Command::VIDEO_START;
     const bool running = fresh && (video ? lastStatus_.video_running() : lastStatus_.recording());
     const bool local = video && controlsLocalVideo();
-    const bool playing = local && localVideoPlaying();
+    const bool playing = video && localVideoPlaying();
     const bool requested = local && localVideoRequested();
     const bool pending = mediaOperations_.contains(start);
-    QString text = local ? (requested ? "停止播放" : "播放视频")
-                   : video ? (running ? "停止视频" : "开启视频")
-                         : (running ? "停止记录" : "开始记录");
+    QString text = video ? ((local ? requested : running) ? "关闭视频" : "开启视频")
+                         : (running ? "bag 记录中" : "bag 记录");
     QString state = local ? (playing ? "● 本机播放中"
-                                     : requested ? "本机视频连接中…" : "本机播放已停止")
+                                     : requested ? (videoRetry_.isActive()
+                                                        ? "本机视频连接失败，正在重试"
+                                                        : "本机视频连接中…")
+                                                 : "本机播放已停止")
                     : !online ? "未连接" : !fresh ? "等待有效状态"
-                    : running ? (video ? "● 视频运行中" : "● 正在记录")
-                              : (video ? "视频已停止" : "记录已停止");
+                    : running ? (video ? (playing ? "● 任务机推流中，本机已播放"
+                                                   : "● 任务机推流中，本机画面未就绪")
+                                       : "● bag 记录中")
+                              : (video ? "视频已停止" : "bag 已停止");
     QString tip = state;
+    if (local && requested && player_->error() != QMediaPlayer::NoError &&
+        !player_->errorString().isEmpty())
+      tip += "；" + player_->errorString();
     if (pending) {
       const auto &operation = mediaOperations_[start];
-      text = operation.target ? (video ? "视频开启中…" : "记录启动中…")
-                              : (video ? "视频停止中…" : "记录停止中…");
+      text = operation.target ? (video ? "视频开启中…" : "bag 启动中…")
+                              : (video ? "视频停止中…" : "bag 停止中…");
       state = operation.succeeded ? "等待状态确认" : "等待任务机执行";
       tip = state;
     } else if (!local && mediaErrors_.contains(start)) {
-      state += mediaErrors_[start].startsWith("操作超时") ? " · 操作超时" : " · 操作失败";
+      const bool timeout = mediaErrors_[start].startsWith("操作超时");
+      text = video ? (timeout ? "视频操作超时" : "视频操作失败")
+                   : (timeout ? "bag 操作超时" : "bag 操作失败");
+      state += timeout ? " · 操作超时" : " · 操作失败";
       tip = mediaErrors_[start];
     }
     if (demo_)
       state.prepend("模拟 · ");
     auto update = [&](QPushButton *b, QLabel *label) {
-      if (!b || !label)
+      if (!b)
         return;
       b->setText(text);
       b->setEnabled((local || fresh) && !pending);
       b->setToolTip(tip);
-      label->setText(state);
-      label->setToolTip(tip);
+      if (label) {
+        label->setText(state);
+        label->setToolTip(tip);
+      }
       const bool active = (running || playing) && !pending;
       if (!b->property("serviceRunning").isValid() ||
           b->property("serviceRunning").toBool() != active) {
@@ -968,7 +1042,7 @@ void MissionController::refreshMediaButtons() {
         b->update();
       }
     };
-    update(commands_.value(start, nullptr), mediaStates_.value(start, nullptr));
+    update(commands_.value(start, nullptr), nullptr);
     if (!video)
       update(logRecordButton_, logRecordState_);
     else if (statusCells_.size() > 8 && local)
@@ -2292,6 +2366,8 @@ void MissionController::smoke() {
     const bool video = start == mission::Command::VIDEO_START;
     b->click();
     mediaControls &= b->isEnabled() && b->property("serviceRunning").toBool();
+    if (video)
+      mediaControls &= b->text() == "关闭视频";
     if (!video)
       mediaControls &= logRecordButton_->text() == b->text();
   }
@@ -2300,6 +2376,8 @@ void MissionController::smoke() {
   commands_.value(mission::Command::VIDEO_START)->click();
   logRecordButton_->click();
   mediaControls &= !lastStatus_.video_running() && !lastStatus_.recording();
+  mediaControls &= commands_.value(mission::Command::VIDEO_START)->text() ==
+                   "开启视频";
   for (auto start : {mission::Command::VIDEO_START, mission::Command::RECORD_START}) {
     auto *b = commands_.value(start);
     MediaOperation operation;
@@ -2336,7 +2414,7 @@ void MissionController::smoke() {
     result.mutable_result()->set_detail("smoke failure");
     receive(result);
     mediaControls &= b->isEnabled() && !b->property("serviceRunning").toBool() &&
-                     mediaStates_[start]->text().contains("操作失败");
+                     b->text().contains("操作失败");
   }
   statusAge_.invalidate();
   refreshMediaButtons();
@@ -2845,7 +2923,7 @@ void MissionController::smoke() {
                           loadedCloud->size() == unsigned(mapPoints_.size());
   QApplication::processEvents();
   window_->screen()->grabWindow(window_->winId()).save(p + "/pcd-loaded.png");
-  auto *workspaceMenu = window_->menuBar()->findChild<QMenu *>("missionWorkspaceMenu");
+  auto *workspaceMenu = window_->menuBar()->findChild<QMenu *>("missionMainMenu");
   QAction *firstVisibleMenu = nullptr;
   for (auto *action : window_->menuBar()->actions()) {
     if (action->isVisible()) {
@@ -2860,9 +2938,8 @@ void MissionController::smoke() {
   };
   checkWorkspace("menu", workspaceMenu &&
                              firstVisibleMenu == workspaceMenu->menuAction() &&
-                             workspaceMenu->actions().size() == 3 &&
-                             !window_->menuBar()->actions().contains(
-                                 workspaceActions_.value(static_cast<int>(Workspace::Monitor))));
+                             workspaceMenu->actions().size() == 5 &&
+                             workspaceMenu->actions().first()->text() == "显示对象列表");
   checkWorkspace("menu_height", window_->menuBar()->height() <= 36 &&
                                     latest_->height() <= window_->menuBar()->height() &&
                                     latest_->y() >= 0);
@@ -2871,18 +2948,19 @@ void MissionController::smoke() {
         QPoint(8, window_->menuBar()->height())));
     QApplication::processEvents();
     checkWorkspace("dropdown", workspaceMenu->isVisible() &&
-                                   workspaceActions_.value(static_cast<int>(Workspace::Monitor))->isChecked());
+                                   workspaceMenu->actions().first()->isChecked());
     workspaceMenu->grab().save(p + "/workspace-menu.png");
     workspaceMenu->hide();
   }
   const unsigned dbCountBeforeProcessing =
       window_->dbRootObject()->getChildrenNumber();
-  workspaceActions_[static_cast<int>(Workspace::Processing)]->trigger();
+  const bool currentCloudSelected = selectCurrentCloud();
   QApplication::processEvents();
-  checkWorkspace("processing", workspace_ == Workspace::Processing &&
+  checkWorkspace("processing", currentCloudSelected &&
                                    objectsCard_->isVisible() &&
                                    processingCard_->isVisible() &&
-                                   !right_->isVisible());
+                                   right_->isVisible() &&
+                                   top_->isVisible() && editor_->isVisible());
   const auto &processingSelection = window_->getSelectedEntities();
   const auto *currentCloud = processingSelection.size() == 1
                                  ? dynamic_cast<ccPointCloud *>(processingSelection.front())
@@ -2921,15 +2999,272 @@ void MissionController::smoke() {
     refreshProcessingObjects();
     checkWorkspace("clone_list", processingObjects_->count() >= 2);
   }
+  if (qEnvironmentVariableIsSet("THREEDG_SMOKE_OBJECT_MENU")) {
+    QMenu *fileMenu = nullptr;
+    for (auto *action : window_->menuBar()->actions())
+      if (action->text() == "文件")
+        fileMenu = action->menu();
+    bool importInFileMenu = false;
+    if (fileMenu)
+      for (auto *action : fileMenu->actions())
+        importInFileMenu |= action->text() == "导入文件（处理对象）…";
+    bool importInObjectCard = false;
+    for (auto *button : objectsCard_->findChildren<QPushButton *>())
+      importInObjectCard |= button->text().contains("导入文件");
+    checkWorkspace("object_import_menu", importInFileMenu && !importInObjectCard);
+    auto *sample = new ccPointCloud("对象菜单测试");
+    sample->addPoint(CCVector3(0, 0, 0));
+    sample->addPoint(CCVector3(1, 0, 0));
+    sample->addPoint(CCVector3(0, 1, 0));
+    sample->setDisplay(gl_);
+    window_->addToDB(sample, false, true, false, true);
+    refreshProcessingObjects();
+    auto selectListItem = [this](unsigned id) {
+      for (int row = 0; row < processingObjects_->count(); ++row) {
+        auto *item = processingObjects_->item(row);
+        if (item->data(Qt::UserRole).toUInt() == id) {
+          processingObjects_->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+          return item;
+        }
+      }
+      return static_cast<QListWidgetItem *>(nullptr);
+    };
+    auto *sampleItem = selectListItem(sample->getUniqueID());
+    const int expandedHeight = objectsCard_->height();
+    objectsFold_->click();
+    QApplication::processEvents();
+    objectsCard_->grab().save(p + "/objects-collapsed.png");
+    checkWorkspace("object_fold", !objectsContent_->isVisible() &&
+                                    objectsCard_->height() < expandedHeight);
+    objectsFold_->click();
+    QApplication::processEvents();
+    checkWorkspace("object_expand", objectsContent_->isVisible() &&
+                                      objectsCard_->height() == expandedHeight);
+    const QSize originalObjectSize = objectsCard_->size();
+    const QPoint gripGlobal = objectsResizeGrip_->mapToGlobal(QPoint(8, 8));
+    QMouseEvent resizePress(QEvent::MouseButtonPress, QPointF(8, 8),
+                            QPointF(gripGlobal), Qt::LeftButton,
+                            Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(objectsResizeGrip_, &resizePress);
+    QMouseEvent resizeMove(QEvent::MouseMove, QPointF(8, 8),
+                           QPointF(gripGlobal + QPoint(80, 90)), Qt::NoButton,
+                           Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(objectsResizeGrip_, &resizeMove);
+    QMouseEvent resizeRelease(QEvent::MouseButtonRelease, QPointF(8, 8),
+                              QPointF(gripGlobal + QPoint(80, 90)), Qt::LeftButton,
+                              Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(objectsResizeGrip_, &resizeRelease);
+    QApplication::processEvents();
+    const QSize resizedObjectSize = objectsCard_->size();
+    checkWorkspace("object_resize", resizedObjectSize.width() == originalObjectSize.width() + 80 &&
+                                        resizedObjectSize.height() == originalObjectSize.height() + 90);
+    objectsCard_->grab().save(p + "/objects-resized.png");
+    objectsFold_->click();
+    objectsFold_->click();
+    QApplication::processEvents();
+    checkWorkspace("object_resize_restore", objectsCard_->size() == resizedObjectSize);
+    objectsExpandedSize_ = QSize(190, 360);
+    arrange();
+    bool contextMenuReady = false;
+    if (sampleItem) {
+      QTimer::singleShot(0, this, [&contextMenuReady, &p] {
+        auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        if (!menu)
+          return;
+        menu->grab().save(p + "/objects-context-menu.png");
+        QStringList labels;
+        for (auto *action : menu->actions())
+          if (!action->isSeparator())
+            labels << action->text();
+        contextMenuReady = labels == QStringList{"复制", "粘贴", "重命名", "删除"};
+        menu->close();
+      });
+      showProcessingObjectMenu(processingObjects_->visualItemRect(sampleItem).center());
+    }
+    checkWorkspace("object_context_menu", contextMenuReady);
+    copyProcessingObjects();
+    checkWorkspace("object_copy", objectClipboard_.size() == 1 &&
+                                      objectClipboard_.front()->getName() == sample->getName());
+    const unsigned beforePaste = window_->dbRootObject()->getChildrenNumber();
+    pasteProcessingObjects();
+    ccHObject::Container pastedSelection;
+    window_->db()->getSelectedEntities(pastedSelection);
+    auto *pastedObject = pastedSelection.size() == 1
+        ? dynamic_cast<ccPointCloud *>(pastedSelection.front()) : nullptr;
+    const unsigned pastedId = pastedObject ? pastedObject->getUniqueID() : 0;
+    checkWorkspace("object_paste", pastedObject && pastedObject != sample &&
+                                       pastedObject->size() == sample->size() &&
+                                       window_->dbRootObject()->getChildrenNumber() == beforePaste + 1);
+    bool renameDialogReady = false;
+    if (pastedObject && selectListItem(pastedId)) {
+      QTimer::singleShot(0, this, [&renameDialogReady] {
+        auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget());
+        if (!dialog)
+          return;
+        renameDialogReady = true;
+        dialog->setTextValue("对象菜单已重命名");
+        dialog->accept();
+      });
+      renameProcessingObject();
+    }
+    checkWorkspace("object_rename", renameDialogReady && pastedObject &&
+                                        pastedObject->getName() == "对象菜单已重命名");
+    bool deleteDialogReady = false;
+    if (pastedObject && selectListItem(pastedId)) {
+      QTimer::singleShot(0, this, [&deleteDialogReady] {
+        auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (!dialog)
+          return;
+        deleteDialogReady = true;
+        dialog->button(QMessageBox::Yes)->click();
+      });
+      deleteProcessingObjects();
+    }
+    checkWorkspace("object_delete", deleteDialogReady &&
+                                        !window_->dbRootObject()->find(pastedId));
+    window_->db()->selectEntities({sample});
+    window_->db()->deleteSelectedEntities();
+    refreshProcessingObjects();
+  }
+  if (qEnvironmentVariableIsSet("THREEDG_SMOKE_NOISE")) {
+    auto *sample = new ccPointCloud("噪点测试平面");
+    for (int y = 0; y < 20; ++y)
+      for (int x = 0; x < 20; ++x)
+        sample->addPoint(CCVector3(float(x) * 0.1f, float(y) * 0.1f, 0));
+    sample->addPoint(CCVector3(100, 100, 100));
+    sample->setDisplay(gl_);
+    sample->setVisible(true);
+    window_->addToDB(sample, false, true, false, true);
+    window_->db()->selectEntities({sample});
+    QApplication::processEvents();
+    checkWorkspace("noise_workspace", right_->isVisible() &&
+                                         processingCard_->isVisible());
+    checkWorkspace(QString("noise_selected_%1_%2")
+                       .arg(window_->getSelectedEntities().size())
+                       .arg(sample->size()),
+                   window_->getSelectedEntities().size() == 1 &&
+                       window_->getSelectedEntities().front() == sample &&
+                       sample->size() == 401);
+    auto *toolsMenu = window_->menuBar()->findChild<QMenu *>("missionToolsMenu");
+    checkWorkspace("noise_menu", toolsMenu &&
+                                     toolsMenu->title() == "工具" &&
+                                     toolsMenu->actions().size() >= 5);
+    QSettings noiseSettings("3DG", "Mission");
+    const QVariant savedKnn = noiseSettings.value("noiseKnn");
+    const QVariant savedSigma = noiseSettings.value("noiseSigma");
+    const QVariant savedPointSize = noiseSettings.value("noisePointSize");
+    const int originalKnn = noiseKnn_, originalPointSize = noisePointSize_;
+    const double originalSigma = noiseSigma_;
+    bool parameterDialogOpened = false;
+    if (toolsMenu) {
+      QTimer::singleShot(0, this, [&parameterDialogOpened, p] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!dialog || dialog->windowTitle() != "噪点检测参数")
+          return;
+        parameterDialogOpened = true;
+        auto *knn = dialog->findChild<QSpinBox *>("noiseKnn");
+        auto *sigma = dialog->findChild<QDoubleSpinBox *>("noiseSigma");
+        auto *pointSize = dialog->findChild<QSpinBox *>("noisePointSize");
+        if (!knn || !sigma || !pointSize) {
+          dialog->reject();
+          return;
+        }
+        knn->setValue(8);
+        sigma->setValue(1.5);
+        pointSize->setValue(9);
+        dialog->grab().save(p + "/noise-parameters.png");
+        dialog->accept();
+      });
+    }
+    if (toolsMenu)
+      toolsMenu->actions().at(1)->trigger();
+    noiseSettings.sync();
+    checkWorkspace("noise_parameters", parameterDialogOpened && noiseKnn_ == 8 &&
+                                            noiseSigma_ == 1.5 &&
+                                            noisePointSize_ == 9 &&
+                                            noiseSettings.value("noiseKnn").toInt() == 8 &&
+                                            noiseSettings.value("noiseSigma").toDouble() == 1.5 &&
+                                            noiseSettings.value("noisePointSize").toInt() == 9);
+    if (toolsMenu)
+      toolsMenu->actions().first()->trigger();
+    auto *sourceCopy = window_->dbRootObject()->find(noiseSourceId_);
+    auto *outliers = dynamic_cast<ccPointCloud *>(
+        window_->dbRootObject()->find(noiseResultId_));
+    checkWorkspace(QString("noise_count_%1_%2").arg(outliers ? outliers->size() : 0u)
+                       .arg(sourceCopy ? static_cast<ccPointCloud *>(sourceCopy)->size() : 0u),
+                   outliers && outliers->size() == 1);
+    checkWorkspace("noise_effective_parameters", outliers &&
+                       outliers->getMetaData("3dg.noise.knn").toInt() == 8 &&
+                       outliers->getMetaData("3dg.noise.sigma").toDouble() == 1.5 &&
+                       outliers->getPointSize() == 9);
+    checkWorkspace("noise_source_name", sourceCopy &&
+                                            sourceCopy->getName().contains("噪点测试平面"));
+    checkWorkspace("noise_overlay", sourceCopy && outliers &&
+                                       sourceCopy->isVisible() &&
+                                       outliers->isVisible());
+    QApplication::processEvents();
+    checkWorkspace("noise_original_selected", sourceCopy &&
+                       window_->getSelectedEntities().size() == 1 &&
+                       window_->getSelectedEntities().front() == sourceCopy);
+    noiseOnlyAction_->trigger();
+    checkWorkspace("noise_only", sourceCopy && outliers &&
+                                    !sourceCopy->isVisible() &&
+                                    outliers->isVisible() &&
+                                    !sample->isVisible() &&
+                                    !map_->isEnabled());
+    noiseRestoreAction_->trigger();
+    checkWorkspace("noise_restore", sourceCopy && outliers &&
+                                       !sourceCopy->isVisible() &&
+                                       !outliers->isVisible() &&
+                                       sample->isVisible() &&
+                                       map_->isEnabled());
+    noiseOverlayAction_->trigger();
+    window_->db()->selectEntities({outliers});
+    QApplication::processEvents();
+    if (toolsMenu)
+      toolsMenu->actions().first()->trigger();
+    auto *secondSource = dynamic_cast<ccPointCloud *>(
+        window_->dbRootObject()->find(noiseSourceId_));
+    auto *secondOutliers = dynamic_cast<ccPointCloud *>(
+        window_->dbRootObject()->find(noiseResultId_));
+    checkWorkspace("noise_rerun_original", secondSource && secondOutliers &&
+                                           secondSource->size() == 401 &&
+                                           secondOutliers->size() == 1);
+    noiseRestoreAction_->trigger();
+    noiseKnn_ = originalKnn;
+    noiseSigma_ = originalSigma;
+    noisePointSize_ = originalPointSize;
+    const auto restoreSetting = [&noiseSettings](const char *key, const QVariant &value) {
+      if (value.isValid())
+        noiseSettings.setValue(key, value);
+      else
+        noiseSettings.remove(key);
+    };
+    restoreSetting("noiseKnn", savedKnn);
+    restoreSetting("noiseSigma", savedSigma);
+    restoreSetting("noisePointSize", savedPointSize);
+    noiseSettings.sync();
+  }
+  auto *cloudToolsButton = top_->findChild<QPushButton *>("openCloudTools");
+  if (cloudToolsButton)
+    cloudToolsButton->click();
+  QApplication::processEvents();
+  const int toolY = processingCard_->mapTo(detailsScroll_->viewport(), QPoint()).y();
+  checkWorkspace("tools_reachable", cloudToolsButton &&
+      toolY >= 0 && toolY < detailsScroll_->viewport()->height());
+  auto *endMissionButton = commands_.value(mission::Command::END_MISSION);
+  checkWorkspace("task_controls_fixed", endMissionButton &&
+      endMissionButton->isVisible() &&
+      endMissionButton->mapTo(right_, QPoint()).y() < right_->height());
   window_->grab().save(p + "/processing.png");
-  workspaceActions_[static_cast<int>(Workspace::Comparison)]->trigger();
+  toolsTabs_->setCurrentWidget(comparisonOnly_);
   QApplication::processEvents();
   const int comparisonSelectedCount = static_cast<int>(window_->getSelectedEntities().size());
   const bool comparisonCardVisible = comparisonOnly_->isVisible() &&
                                       !processingOnly_->isVisible();
   const bool comparisonRolesDiffer = referenceObject_->currentData().toUInt() !=
                                      targetObject_->currentData().toUInt();
-  checkWorkspace("comparison", workspace_ == Workspace::Comparison &&
+  checkWorkspace("comparison", right_->isVisible() && top_->isVisible() &&
                                    objectsCard_->isVisible() &&
                                    processingCard_->isVisible() &&
                                    comparisonCardVisible &&
@@ -2939,7 +3274,7 @@ void MissionController::smoke() {
   window_->grab().save(p + "/comparison.png");
   bool poissonOk = true;
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_POISSON")) {
-    setWorkspace(Workspace::Processing, false);
+    toolsTabs_->setCurrentWidget(processingOnly_);
     auto *sample = new ccPointCloud("泊松测试球");
     constexpr double pi = 3.14159265358979323846;
     for (int latitude = 1; latitude < 24; ++latitude) {
@@ -2965,11 +3300,11 @@ void MissionController::smoke() {
     checkWorkspace("poisson_mesh", poissonOk);
     window_->grab().save(p + "/poisson-mesh.png");
   }
-  workspaceActions_[static_cast<int>(Workspace::Monitor)]->trigger();
+  toolsTabs_->setCurrentWidget(processingOnly_);
   QApplication::processEvents();
-  checkWorkspace("return_monitor", workspace_ == Workspace::Monitor &&
+  checkWorkspace("return_monitor", top_->isVisible() && editor_->isVisible() &&
                                        right_->isVisible() &&
-                                       !objectsCard_->isVisible());
+                                       objectsCard_->isVisible());
   const bool workspaceUi = workspaceProblems.isEmpty();
   bool missionRead = importMission(p + "/mission.3dg.json");
   bool videoOk = player_->state() == QMediaPlayer::PlayingState &&
@@ -2982,20 +3317,20 @@ void MissionController::smoke() {
     refreshMediaButtons();
     auto *button = commands_.value(mission::Command::VIDEO_START);
     const int pendingCount = pendingKinds_.size();
-    localVideoControls = button->isEnabled() && button->text() == "停止播放" &&
-                         mediaStates_[mission::Command::VIDEO_START]->text().contains("本机播放中") &&
+    localVideoControls = button->isEnabled() && button->text() == "关闭视频" &&
+                         button->toolTip().contains("本机播放中") &&
                          statusCells_[8]->text() == "视频 本机播放中";
     mission::Envelope unrelatedVideoStop;
     unrelatedVideoStop.mutable_video()->set_running(false);
     receive(unrelatedVideoStop);
     localVideoControls &= localVideoPlaying() && videoUrl_ == smokeVideoUrl &&
-                          button->text() == "停止播放";
+                          button->text() == "关闭视频";
     right_->grab().save(p + "/media-local-running.png");
     demo_ = ready_ = false;
     refreshMediaButtons();
-    localVideoControls &= button->isEnabled() && button->text() == "停止播放";
+    localVideoControls &= button->isEnabled() && button->text() == "关闭视频";
     button->click();
-    localVideoControls &= button->text() == "播放视频" &&
+    localVideoControls &= button->text() == "开启视频" &&
                           !localVideoRequested() && pendingKinds_.size() == pendingCount;
     button->click();
     localVideoControls &= localVideoRequested() && pendingKinds_.size() == pendingCount;

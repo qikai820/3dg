@@ -13,7 +13,7 @@
 class ProtocolClient : public QObject {
   Q_OBJECT
 public:
-  explicit ProtocolClient(QObject *parent = nullptr);
+  explicit ProtocolClient(QObject *parent = nullptr, bool timeSyncEnabled = true);
   void open(const QUrl &base);
   void stop();
   bool ready() const { return ready_; }
@@ -22,6 +22,8 @@ public:
   }
   bool routeEditSupported() const { return routeEditSupported_; }
   bool routeDeleteSupported() const { return routeDeleteSupported_; }
+  bool bagReplaySupported() const { return bagReplaySupported_; }
+  bool odinProjectionSupported() const { return odinProjectionSupported_; }
   quint64 receivedMessages() const { return receivedMessages_; }
   quint64 invalidMessages() const { return invalidMessages_; }
   double receiveMbps() const { return receiveMbps_; }
@@ -53,6 +55,7 @@ private:
   QHash<int, quint64> sequences_;
   QHash<QString, qint64> pending_;
   mission::Envelope latestCloud_;
+  mission::Envelope latestProjection_;
   QUrl base_;
   QString remoteSession_, localSession_;
   QString timeProbeRequest_, setTimeRequest_;
@@ -64,6 +67,9 @@ private:
   double receiveMbps_ = 0, transmitMbps_ = 0;
   bool desired_ = false, ready_ = false;
   bool timeSyncSupported_ = false, timeChecked_ = false;
+  bool timeSyncEnabled_ = true;
   bool routeEditSupported_ = false;
   bool routeDeleteSupported_ = false;
+  bool bagReplaySupported_ = false;
+  bool odinProjectionSupported_ = false;
 };

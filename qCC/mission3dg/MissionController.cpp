@@ -1,5 +1,6 @@
 #undef QT_USE_QSTRINGBUILDER
 #include "MissionController.h"
+#include "BagReplayToolbar.h"
 #include "FlightReplayDialog.h"
 #include "OdinDataManagerDialog.h"
 #include "QuadrotorModel.h"
@@ -23,16 +24,41 @@
 #include <ccGLUtils.h>
 #include <ccGLWindowInterface.h>
 #include <ccGLWindowSignalEmitter.h>
+#include <ccGenericPrimitive.h>
+#include <ccHObjectCaster.h>
 #include <ccPickingHub.h>
 #include <ccPointCloud.h>
+#include <ccProgressDialog.h>
 #include <ccMesh.h>
 #include <ccPluginManager.h>
 #include <ccPolyline.h>
 #include <ccStdPluginInterface.h>
+#include <algorithm>
 #include <cmath>
+#include <CloudSamplingTools.h>
+#include <ReferenceCloud.h>
 #include <set>
 #include <tuple>
+#include <vector>
 #include <google/protobuf/util/json_util.h>
+
+class ProcessingResizeHandle final : public QWidget {
+public:
+  explicit ProcessingResizeHandle(QWidget *parent) : QWidget(parent) {
+    setFixedSize(12, 12);
+    setCursor(Qt::SizeFDiagCursor);
+  }
+
+protected:
+  void paintEvent(QPaintEvent *) override {
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(67, 100, 119), 1.3, Qt::SolidLine, Qt::RoundCap));
+    for (int i = 0; i < 3; ++i)
+      painter.drawLine(QPoint(width() - 5 - i * 3, height() - 2),
+                       QPoint(width() - 2, height() - 5 - i * 3));
+  }
+};
 
 // Paint decoded frames as ordinary widgets. QVideoWidget's native video window
 // promotes sibling cards to native surfaces and breaks alpha overlays on GL.
@@ -315,6 +341,12 @@ namespace {
 // The task-machine preview defaults to 0.2 Hz and can be set as low as 0.1 Hz.
 // Keep a received snapshot through one delayed update; disconnect clears it.
 constexpr int kGridStaleMs = 20000;
+struct OverlayColor {
+  unsigned char red, green, blue;
+};
+constexpr OverlayColor kCameraFovColor{84, 216, 243};
+constexpr OverlayColor kLidarFovColor{255, 190, 100};
+constexpr OverlayColor kAircraftInflationColor{202, 166, 250};
 QPushButton *button(QBoxLayout *l, const QString &t, std::function<void()> f) {
   auto *b = new QPushButton(t);
   l->addWidget(b);
@@ -336,6 +368,29 @@ QFrame *card(QWidget *p, const QString &title) {
 }
 QVBoxLayout *box(QWidget *w) {
   return qobject_cast<QVBoxLayout *>(w->layout());
+}
+bool canCopyProcessingObject(const ccHObject *object) {
+  return object && (object->isKindOf(CC_TYPES::POINT_CLOUD) ||
+                    object->isKindOf(CC_TYPES::PRIMITIVE) ||
+                    object->isA(CC_TYPES::MESH));
+}
+std::unique_ptr<ccHObject> cloneProcessingObject(ccHObject *source) {
+  ccHObject *clone = nullptr;
+  if (source->isKindOf(CC_TYPES::POINT_CLOUD)) {
+    if (auto *cloud = ccHObjectCaster::ToGenericPointCloud(source))
+      clone = cloud->clone();
+  } else if (source->isKindOf(CC_TYPES::PRIMITIVE)) {
+    if (auto *primitive = dynamic_cast<ccGenericPrimitive *>(source))
+      clone = primitive->clone();
+  } else if (source->isA(CC_TYPES::MESH)) {
+    if (auto *mesh = ccHObjectCaster::ToMesh(source))
+      clone = mesh->cloneMesh();
+  }
+  if (clone) {
+    clone->setGLTransformationHistory(source->getGLTransformationHistory());
+    clone->setName(source->getName());
+  }
+  return std::unique_ptr<ccHObject>(clone);
 }
 QVector3D vec(const mission::Vec3 &p) { return QVector3D(p.x(), p.y(), p.z()); }
 void setvec(mission::Vec3 *p, const QVector3D &v) {
@@ -428,7 +483,9 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
                                      s.flight_mode() != "UNKNOWN"
                                  ? QString::fromStdString(s.flight_mode()) : "未知";
   hud_->setText(
-      QString("解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6")
+      QString(bagReplayActive_
+                  ? "历史 bag 回放\n解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6"
+                  : "解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6")
           .arg(armed, flightMode, angles, speed, position,
                s.battery_valid()
                    ? QString::number(s.battery_percent(), 'f', 0) + "%"
@@ -467,6 +524,10 @@ MissionController::MissionController(MainWindow *w)
   grid_ = group("EGO 栅格地图");
   trail_ = group("实际轨迹");
   aircraft_ = group("无人机");
+  cameraFov_ = group("Odin1 RGB 相机视场");
+  lidarFov_ = group("Odin1 激光雷达视场");
+  imageProjection_ = group("Odin1 图像投影 · 点云贴图");
+  aircraftInflation_ = group("飞机等效膨胀区");
   replay_ = group("飞行记录回放 · 历史数据");
   replay_->setVisible(false);
   auto replayLayer = [this](const QString &name) {
@@ -511,6 +572,16 @@ MissionController::MissionController(MainWindow *w)
       s.value("gridSizePercent", gridSizePercent_).toInt();
   if (savedGridSizePercent >= 10 && savedGridSizePercent <= 100)
     gridSizePercent_ = savedGridSizePercent;
+  const int savedNoiseKnn = s.value("noiseKnn", noiseKnn_).toInt();
+  if (savedNoiseKnn >= 3 && savedNoiseKnn <= 256)
+    noiseKnn_ = savedNoiseKnn;
+  const double savedNoiseSigma = s.value("noiseSigma", noiseSigma_).toDouble();
+  if (std::isfinite(savedNoiseSigma) && savedNoiseSigma >= 0.1 &&
+      savedNoiseSigma <= 10.0)
+    noiseSigma_ = savedNoiseSigma;
+  const int savedNoisePointSize = s.value("noisePointSize", noisePointSize_).toInt();
+  if (savedNoisePointSize >= 2 && savedNoisePointSize <= 12)
+    noisePointSize_ = savedNoisePointSize;
   if (!std::isfinite(voxel_) || voxel_ < .02 || voxel_ > 5)
     voxel_ = .15;
   const auto logs =
@@ -564,6 +635,7 @@ MissionController::MissionController(MainWindow *w)
             connectionState_ = t;
             refreshLinkStats();
             if (r) {
+              refreshOdinOverlayStatus();
               importRemoteOnReceive_ = mission_.waypoints_size() == 0;
               importRemoteAsUploaded_ = false;
               routeImportMissionRevision_ = mission_.revision();
@@ -574,6 +646,7 @@ MissionController::MissionController(MainWindow *w)
               clearRemoteRoute();
             mode_->setText(replayDialog_
                                ? "◷ 飞行记录回放 · 历史数据 · " + t
+                               : bagReplayActive_ ? "◷ bag 回放 · 历史数据 · " + t
                                : (demo_ ? "● 模拟演示 · 非真实遥测"
                                         : (r ? "● " + t : "○ " + t)));
             connectButton_->setText(r ? "断开" : "连接");
@@ -599,6 +672,7 @@ MissionController::MissionController(MainWindow *w)
                 aircraftModel_->setVisible(false);
               ego_->setVisible(false);
               expireGrid();
+              clearOdinOverlays();
               dirty_ = true;
               vehicleAge_.invalidate();
               if (!replayDialog_) {
@@ -646,7 +720,9 @@ MissionController::MissionController(MainWindow *w)
       download_.reset();
       log("文件下载超时，未完成文件已取消");
     }
-    if (!demo_ && vehicleAge_.isValid() && vehicleAge_.elapsed() > 3000) {
+    if (!demo_ && bagReplayState_ != mission::ReplayStatus::PAUSED &&
+        bagReplayState_ != mission::ReplayStatus::ENDED &&
+        vehicleAge_.isValid() && vehicleAge_.elapsed() > 3000) {
       if (!replayDialog_) {
         hud_->setText("遥测已过期（超过 3 秒）\n解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
         attitude_->valid = false;
@@ -663,6 +739,23 @@ MissionController::MissionController(MainWindow *w)
     }
     if (!demo_ && gridAge_.isValid() && gridAge_.elapsed() > kGridStaleMs)
       expireGrid();
+    if (!demo_ && sensorAge_.isValid() && sensorAge_.elapsed() > 1500) {
+      sensorAge_.invalidate();
+      lastSensorPose_.Clear();
+      cameraFov_->removeAllChildren();
+      lidarFov_->removeAllChildren();
+      aircraftInflation_->removeAllChildren();
+      refreshOdinOverlayStatus();
+      gl_->redraw();
+    }
+    if (!demo_ && projectionAge_.isValid() &&
+        projectionAge_.elapsed() > 3000) {
+      projectionPoints_.clear();
+      imageProjection_->removeAllChildren();
+      projectionAge_.invalidate();
+      refreshOdinOverlayStatus();
+      gl_->redraw();
+    }
   });
   staleTimer_.start(1000);
   connect(gl_->signalEmitter(), &ccGLWindowSignalEmitter::aboutToClose, this,
@@ -683,6 +776,10 @@ MissionController::MissionController(MainWindow *w)
     log("X500 模型资源加载失败，无法显示无人机模型");
   if (qEnvironmentVariableIsSet("THREEDG_DEMO"))
     setDemo(true);
+  else {
+    client_.open(QUrl(baseUrl_));
+    log("正在连接任务机：" + baseUrl_, "连接");
+  }
   if (qEnvironmentVariableIsSet("THREEDG_SMOKE_VIDEO")) {
     videoUrl_ = qEnvironmentVariable("THREEDG_SMOKE_VIDEO");
     showVideo();
@@ -791,6 +888,7 @@ void MissionController::buildUi() {
       "border-radius:7px;color:#2b4654;font-size:11px;padding:"
       "1px 10px;}"
       "QCheckBox{color:#2d4655;spacing:7px;padding:5px 3px;}"
+      "QCheckBox#sensorToggle{padding:3px 3px;}"
       "QCheckBox::indicator{width:11px;height:11px;border:1px solid #90a8b7;"
       "border-radius:6px;background:#f5fafc;}"
       "QCheckBox::indicator:checked{background:#58cdb5;border-color:#58cdb5;}"
@@ -816,35 +914,63 @@ void MissionController::buildUi() {
       "QStatusBar{background:rgba(236,246,250,246);color:#5a7180;"
       "border-top:1px solid #d6e5ec;min-height:23px;}"
       "QStatusBar::item{border:0;}"
+      "QToolBar#bagReplayDock{background:transparent;border:0;padding:2px 0 3px 0;}"
+      "QFrame#bagReplayToolbar{background:rgba(235,244,249,245);"
+      "border:1px solid #c8d9e2;border-radius:9px;}"
       "QDialog{background:#edf5f9;color:#304756;}"
       "QProgressBar{background:#d7e6eb;border:0;border-radius:3px;min-height:"
       "6px;"
       "max-height:6px;text-align:center;}"
       "QProgressBar::chunk{background:#54cbb3;border-radius:3px;}";
   window_->setStyleSheet(css);
+  auto *replayDock = new QToolBar(window_);
+  replayDock->setObjectName("bagReplayDock");
+  replayDock->setWindowTitle("bag 回放");
+  replayDock->setMovable(false);
+  replayDock->setFloatable(false);
+  replayDock->setAllowedAreas(Qt::BottomToolBarArea);
+  replayDock->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+  auto *replayHolder = new QWidget(replayDock);
+  replayHolder->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  auto *replayLayout = new QHBoxLayout(replayHolder);
+  replayLayout->setContentsMargins(0, 0, 0, 0);
+  replayLayout->addStretch();
+  bagReplayToolbar_ = new BagReplayToolbar(&client_, replayHolder);
+  replayLayout->addWidget(bagReplayToolbar_);
+  replayLayout->addStretch();
+  replayDock->addWidget(replayHolder);
+  window_->addToolBar(Qt::BottomToolBarArea, replayDock);
+  bagReplayToolbar_->setWindowWidth(window_->width());
+  window_->installEventFilter(this);
   auto *bar = window_->menuBar();
   bar->setFixedHeight(34);
   for (auto *a : bar->actions())
     a->setVisible(false);
   auto *missionMenu = bar->addMenu("3DG Mission ▾");
-  missionMenu->setObjectName("missionWorkspaceMenu");
-  auto *workspaceGroup = new QActionGroup(missionMenu);
-  workspaceGroup->setExclusive(true);
-  const QVector<QPair<QString, Workspace>> workspaces = {
-      {"任务监控", Workspace::Monitor}, {"点云处理", Workspace::Processing},
-      {"对比分析", Workspace::Comparison}};
-  for (const auto &entry : workspaces) {
-    auto *action = missionMenu->addAction(entry.first);
-    action->setCheckable(true);
-    action->setChecked(entry.second == Workspace::Monitor);
-    action->setActionGroup(workspaceGroup);
-    workspaceActions_[static_cast<int>(entry.second)] = action;
-    connect(action, &QAction::triggered, this,
-            [this, workspace = entry.second] { setWorkspace(workspace); });
-  }
+  missionMenu->setObjectName("missionMainMenu");
+  auto *showObjects = missionMenu->addAction("显示对象列表");
+  showObjects->setCheckable(true);
+  showObjects->setChecked(true);
+  connect(showObjects, &QAction::toggled, this,
+          [this](bool visible) { objectsButton_->setChecked(visible); });
+  auto *showTools = missionMenu->addAction("显示点云工具");
+  showTools->setCheckable(true);
+  showTools->setChecked(true);
+  connect(showTools, &QAction::toggled, this,
+          [this](bool visible) {
+            processingCard_->setVisible(visible);
+            if (visible)
+              detailsScroll_->verticalScrollBar()->setValue(processingCard_->y());
+          });
+  missionMenu->addSeparator();
+  missionMenu->addAction("使用当前点云", this,
+                         [this] { selectCurrentCloud(); });
+  missionMenu->addAction("创建当前地图快照", this,
+                         &MissionController::snapshotMap);
   auto *file = bar->addMenu("文件");
   file->addAction("加载 PCD / PLY 地图", this, &MissionController::loadMap);
-  file->addAction("导入处理对象…", this, &MissionController::importProcessingFiles);
+  file->addAction("导入文件（处理对象）…", this,
+                  &MissionController::importProcessingFiles);
   file->addAction("创建当前地图快照", this, &MissionController::snapshotMap);
   file->addAction("保存点云 PCD", this, &MissionController::saveMap);
   file->addAction("打开航线任务", this, &MissionController::openMission);
@@ -869,6 +995,22 @@ void MissionController::buildUi() {
   auto *analysisMenu = bar->addMenu("分析");
   addProcessingAction(analysisMenu, "点云到点云距离…", "actionCloudCloudDist");
   addProcessingAction(analysisMenu, "点云到网格距离…", "actionCloudMeshDist");
+  auto *toolsMenu = bar->addMenu("工具");
+  toolsMenu->setObjectName("missionToolsMenu");
+  auto *detectNoiseAction = toolsMenu->addAction("自动筛选点云噪点", this,
+                                                &MissionController::detectCloudNoise);
+  detectNoiseAction->setToolTip("使用下方设置的 SOR 参数检测当前点云的离群点");
+  toolsMenu->addAction("噪点检测参数…", this,
+                       &MissionController::configureNoiseDetection);
+  toolsMenu->addSeparator();
+  noiseOverlayAction_ = toolsMenu->addAction("显示原图和噪点（红色）", this,
+                                             [this] { showCloudNoise(false); });
+  noiseOnlyAction_ = toolsMenu->addAction("只显示噪点", this,
+                                          [this] { showCloudNoise(true); });
+  noiseRestoreAction_ = toolsMenu->addAction("恢复原显示", this,
+                                             &MissionController::restoreCloudNoiseView);
+  for (auto *action : {noiseOverlayAction_, noiseOnlyAction_, noiseRestoreAction_})
+    action->setEnabled(false);
   auto *taskMenu = bar->addMenu("任务机");
   auto *modeMenu = taskMenu->addMenu("运行模式");
   taskModeStatus_ = modeMenu->addAction("模式状态：等待任务机");
@@ -893,12 +1035,14 @@ void MissionController::buildUi() {
   taskMenu->addAction("任务机 YAML", this, &MissionController::yamlSettings);
   taskMenu->addAction("保存机载地图", this,
                       [this] { command(mission::Command::SAVE_MAP); });
-  taskMenu->addAction("数据管理…", this, [this] {
-    OdinDataManagerDialog dialog(QUrl(baseUrl_), window_);
-    dialog.exec();
-  });
-  taskMenu->addAction("飞行记录回放…", this, [this] {
+  const auto openFlightReplay = [this](const QString &recordId) {
+    if (bagReplayActive_) {
+      log("请先停止 bag 回放，再打开飞行记录回放");
+      return;
+    }
     if (replayDialog_) {
+      if (!recordId.isEmpty())
+        replayDialog_->selectRemoteRecord(recordId);
       replayDialog_->raise();
       replayDialog_->activateWindow();
       return;
@@ -917,7 +1061,8 @@ void MissionController::buildUi() {
     if (demoAction_)
       demoAction_->setEnabled(false);
     auto *dialog = new FlightReplayDialog(QUrl(baseUrl_),
-        [this](const FlightReplayFrame &frame) { renderFlightReplay(frame); }, window_);
+        [this](const FlightReplayFrame &frame) { renderFlightReplay(frame); },
+        window_, recordId);
     replayDialog_ = dialog;
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QDialog::finished, this, [this] {
@@ -938,7 +1083,16 @@ void MissionController::buildUi() {
         demoAction_->setEnabled(true);
     });
     dialog->show();
+  };
+  taskMenu->addAction("数据管理…", this, [this, openFlightReplay] {
+    OdinDataManagerDialog dialog(QUrl(baseUrl_), window_,
+                                 OdinDataManagerDialog::InitialAction::None, &client_);
+    dialog.exec();
+    if (!dialog.selectedFlightReplayId().isEmpty())
+      openFlightReplay(dialog.selectedFlightReplayId());
   });
+  taskMenu->addAction("飞行记录回放…", this,
+                      [openFlightReplay] { openFlightReplay({}); });
   auto *recordAction = taskMenu->addAction("正在查询录制状态…");
   recordAction->setEnabled(false);
   auto *recordNetwork = new QNetworkAccessManager(taskMenu);
@@ -995,11 +1149,9 @@ void MissionController::buildUi() {
     OdinDataManagerDialog dialog(QUrl(baseUrl_), window_,
         recordAction->data().toBool()
             ? OdinDataManagerDialog::InitialAction::Stop
-            : OdinDataManagerDialog::InitialAction::Start);
+            : OdinDataManagerDialog::InitialAction::Start, &client_);
     dialog.exec();
   });
-  taskMenu->addAction("日志记录", this, [this] { latest_->click(); });
-  taskMenu->addAction("清空累积地图", this, [this] { clearAccumulatedMap(); });
   auto *startup = taskMenu->addMenu("任务启动");
   startup->addAction("启动 Odin1…", this,
                      &MissionController::openOdinStart);
@@ -1011,6 +1163,8 @@ void MissionController::buildUi() {
   view->addAction("俯视", this, [this] { gl_->setView(CC_TOP_VIEW); });
   view->addAction("定位无人机", this, &MissionController::focusAircraft);
   view->addAction("悬浮视频窗口", this, &MissionController::showVideo);
+  auto *display = bar->addMenu("显示");
+  display->addSection("界面卡片");
   auto *demo = view->addAction("模拟演示（非真实遥测）");
   demoAction_ = demo;
   demo->setCheckable(true);
@@ -1036,7 +1190,7 @@ void MissionController::buildUi() {
   box(logPopup_)->addWidget(logCount_);
   auto *logActions = new QHBoxLayout;
   box(logPopup_)->addLayout(logActions);
-  logRecordButton_ = button(logActions, "开始记录", [this] {
+  logRecordButton_ = button(logActions, "bag 记录", [this] {
     toggleMedia(mission::Command::RECORD_START);
   });
   logRecordState_ = new QLabel;
@@ -1097,6 +1251,12 @@ void MissionController::buildUi() {
   picking_ = new QCheckBox("点云拾取");
   tools->addWidget(picking_);
   addTool("适配", [this] { gl_->zoomGlobal(); });
+  auto *cloudToolsButton = addTool("点云工具", [this, showTools] {
+    showTools->setChecked(true);
+    detailsScroll_->verticalScrollBar()->setValue(processingCard_->y());
+  });
+  cloudToolsButton->setObjectName("openCloudTools");
+  cloudToolsButton->setToolTip("定位到右侧点云处理与对比工具");
   tools->addStretch(1);
   auto *viewButton =
       addTool("自由视角", [this] { gl_->setView(CC_ISO_VIEW_1); });
@@ -1172,6 +1332,22 @@ void MissionController::buildUi() {
   auto *divider = new QFrame(left_);
   divider->setFrameShape(QFrame::HLine);
   l->addWidget(divider);
+  objectsButton_ = new QToolButton(left_);
+  objectsButton_->setObjectName("layerTool");
+  objectsButton_->setText("≡");
+  objectsButton_->setToolTip("显示或隐藏点云对象列表");
+  objectsButton_->setAccessibleName("点云对象列表");
+  objectsButton_->setCheckable(true);
+  objectsButton_->setChecked(true);
+  objectsButton_->setFixedSize(42, 42);
+  l->addWidget(objectsButton_);
+  connect(objectsButton_, &QToolButton::toggled, this,
+          [this, showObjects](bool visible) {
+            objectsCard_->setVisible(visible);
+            showObjects->setChecked(visible);
+            if (visible)
+              objectsCard_->raise();
+          });
   heightFilterButton_ = new QToolButton(left_);
   heightFilterButton_->setObjectName("layerTool");
   heightFilterButton_->setText("↕");
@@ -1229,7 +1405,7 @@ void MissionController::buildUi() {
   heightBox->addWidget(heightRangeBottom_);
   heightFilterPanel_->hide();
   connect(heightFilterButton_, &QToolButton::toggled, this, [this](bool shown) {
-    heightFilterPanel_->setVisible(shown && workspace_ == Workspace::Monitor);
+    heightFilterPanel_->setVisible(shown);
     if (shown)
       heightFilterPanel_->raise();
   });
@@ -1463,7 +1639,7 @@ void MissionController::buildUi() {
   right_ = new QFrame(canvas_);
   auto *r = new QVBoxLayout(right_);
   r->setContentsMargins(0, 0, 0, 0);
-  r->setSpacing(12);
+  r->setSpacing(10);
   auto *h = card(right_, "无人机 HUD");
   r->addWidget(h);
   auto *hr = new QHBoxLayout;
@@ -1480,8 +1656,72 @@ void MissionController::buildUi() {
   batteryBar_->setValue(0);
   batteryBar_->setTextVisible(false);
   box(h)->addWidget(batteryBar_);
-  auto *s = card(right_, "任务机状态信息");
-  r->addWidget(s);
+  auto *sensorCard = card(right_, "Odin1 视场与图像");
+  box(sensorCard)->setContentsMargins(10, 7, 10, 7);
+  box(sensorCard)->setSpacing(2);
+  r->addWidget(sensorCard);
+  auto addSensorToggle = [this, sensorCard](const QString &label,
+                                             const QString &hint,
+                                             const QString &key,
+                                             ccHObject *layer,
+                                             const OverlayColor *lineColor) {
+    auto *toggle = new QCheckBox(label, sensorCard);
+    toggle->setObjectName("sensorToggle");
+    if (lineColor) {
+      const QString color = QColor(lineColor->red, lineColor->green,
+                                   lineColor->blue).name();
+      toggle->setStyleSheet(QString("QCheckBox::indicator:checked{background:%1;"
+                                    "border-color:%1;}").arg(color));
+    }
+    toggle->setChecked(QSettings("3DG", "Mission").value(key, true).toBool());
+    toggle->setToolTip(hint);
+    layer->setEnabled(toggle->isChecked());
+    box(sensorCard)->addWidget(toggle);
+    connect(toggle, &QCheckBox::toggled, this, [this, key, layer](bool on) {
+      layer->setEnabled(on);
+      QSettings("3DG", "Mission").setValue(key, on);
+      if (gl_)
+        gl_->redraw();
+    });
+    return toggle;
+  };
+  cameraFovToggle_ = addSensorToggle("相机 129°×104°",
+      "Odin1 标称视场；三维位姿来自雷达 TF 和 Tcl_0 标定逆矩阵",
+      "odinCameraFov", cameraFov_, &kCameraFovColor);
+  lidarFovToggle_ = addSensorToggle("雷达 120°×90°",
+      "Odin1 标称视场；三维位姿来自任务机 lidar TF", "odinLidarFov",
+      lidarFov_, &kLidarFovColor);
+  projectionToggle_ = addSensorToggle("图像投影 · 点云贴图",
+      "仅在同步图像与真实点云相交的位置显示像素", "odinProjection",
+      imageProjection_, nullptr);
+  inflationToggle_ = addSensorToggle("飞机等效膨胀区",
+      "按任务机 EGO 膨胀参数与栅格分辨率绘制世界坐标轴对齐的体积",
+      "odinInflation", aircraftInflation_, &kAircraftInflationColor);
+  sensorOverlayStatus_ = new QLabel(sensorCard);
+  sensorOverlayStatus_->setObjectName("mutedText");
+  sensorOverlayStatus_->setTextFormat(Qt::PlainText);
+  sensorOverlayStatus_->setWordWrap(false);
+  sensorOverlayStatus_->setFixedHeight(36);
+  box(sensorCard)->addWidget(sensorOverlayStatus_);
+  refreshOdinOverlayStatus();
+  auto *sensorVideo = new QPushButton("开启视频", sensorCard);
+  commands_[mission::Command::VIDEO_START] = sensorVideo;
+  sensorVideo->setToolTip("启动或停止任务机视频；图像投影需 Odin1 提供带时间戳的去畸变图像");
+  box(sensorCard)->addWidget(sensorVideo);
+  connect(sensorVideo, &QPushButton::clicked, this,
+          [this] { toggleMedia(mission::Command::VIDEO_START); });
+  detailsScroll_ = new QScrollArea(right_);
+  detailsScroll_->setFrameShape(QFrame::NoFrame);
+  detailsScroll_->setWidgetResizable(true);
+  detailsScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  detailsScroll_->setStyleSheet("QScrollArea{background:transparent;border:0;}"
+                                "QScrollArea>QWidget>QWidget{background:transparent;}");
+  auto *rightContents = new QWidget(detailsScroll_);
+  auto *detailsLayout = new QVBoxLayout(rightContents);
+  detailsLayout->setContentsMargins(0, 0, 0, 0);
+  detailsLayout->setSpacing(10);
+  auto *s = card(rightContents, "任务机状态信息");
+  detailsLayout->addWidget(s);
   auto *statusGrid = new QGridLayout;
   statusGrid->setContentsMargins(0, 0, 0, 0);
   statusGrid->setHorizontalSpacing(8);
@@ -1501,7 +1741,7 @@ void MissionController::buildUi() {
   box(s)->addLayout(statusGrid);
   setStatusCells({"任务机 离线", "Odin1 —", "EGO —", "定位 —",
                   "点云 —", "网络 —", "CPU —", "磁盘 —",
-                  "视频 —", "记录 —"});
+                  "视频 —", "bag 记录 —"});
   auto *o = card(right_, "任务机操作");
   r->addWidget(o);
   auto *grid = new QGridLayout;
@@ -1509,8 +1749,7 @@ void MissionController::buildUi() {
   QVector<QPair<QString, mission::Command::Kind>> ops = {
       {"启动 Odin1", mission::Command::START_ODIN},
       {"启动 EGO", mission::Command::START_EGO},
-      {"开启视频", mission::Command::VIDEO_START},
-      {"开始记录", mission::Command::RECORD_START},
+      {"bag 记录", mission::Command::RECORD_START},
       {"结束任务", mission::Command::END_MISSION}};
   int i = 0;
   for (auto op : ops) {
@@ -1520,18 +1759,8 @@ void MissionController::buildUi() {
     commands_[op.second] = b;
     if (op.second == mission::Command::START_EGO)
       b->setToolTip("确认本地或机载航线后启动 EGO 及实物航线主控；保持上锁，主控就绪后手动解锁");
-    if (op.second == mission::Command::VIDEO_START ||
-        op.second == mission::Command::RECORD_START) {
-      auto *cell = new QVBoxLayout;
-      cell->setSpacing(3);
-      cell->addWidget(b);
-      auto *state = new QLabel;
-      state->setObjectName("mutedText");
-      state->setAlignment(Qt::AlignCenter);
-      state->setWordWrap(true);
-      cell->addWidget(state);
-      mediaStates_[op.second] = state;
-      grid->addLayout(cell, i / 2, i % 2);
+    if (op.second == mission::Command::RECORD_START) {
+      grid->addWidget(b, i / 2, i % 2);
       connect(b, &QPushButton::clicked, this,
               [this, k = op.second] { toggleMedia(k); });
     } else {
@@ -1550,6 +1779,7 @@ void MissionController::buildUi() {
     ++i;
   }
   refreshStartupButtons();
+  r->addWidget(detailsScroll_, 1);
   video_ = new QFrame(canvas_);
   video_->setObjectName("videoOverlay");
   auto *videoLayout = new QVBoxLayout(video_);
@@ -1612,10 +1842,10 @@ void MissionController::buildUi() {
               }
             }
             videoWidget_->update();
+            refreshMediaButtons();
           });
   connect(player_, &QMediaPlayer::mediaStatusChanged, this,
           [this](QMediaPlayer::MediaStatus s) {
-            refreshMediaButtons();
             if (s == QMediaPlayer::StalledMedia ||
                 s == QMediaPlayer::EndOfMedia) {
               if (!videoRetry_.isActive() && !video_->isHidden()) {
@@ -1625,34 +1855,57 @@ void MissionController::buildUi() {
               }
               videoWidget_->update();
             }
+            refreshMediaButtons();
           });
   video_->hide();
-  processingToolbar_ = card(canvas_, "");
-  processingToolbar_->setObjectName("missionToolbar");
-  auto *processingTools = new QHBoxLayout;
-  processingTools->setContentsMargins(0, 0, 0, 0);
-  processingTools->setSpacing(3);
-  box(processingToolbar_)->setContentsMargins(7, 4, 7, 4);
-  box(processingToolbar_)->addLayout(processingTools);
-  button(processingTools, "＋ 导入", [this] { importProcessingFiles(); });
-  button(processingTools, "地图快照", [this] { snapshotMap(); });
-  button(processingTools, "适配视图", [this] { gl_->zoomGlobal(); });
-  button(processingTools, "导出选中", [this] {
-    runCloudCompareAction("actionSave");
+  objectsCard_ = card(canvas_, "");
+  box(objectsCard_)->setContentsMargins(6, 5, 6, 14);
+  box(objectsCard_)->setSpacing(4);
+  auto *objectsHeader = new QHBoxLayout;
+  objectsHeader->setContentsMargins(0, 0, 0, 0);
+  auto *objectsTitle = new QLabel("处理对象", objectsCard_);
+  objectsTitle->setObjectName("cardTitle");
+  objectsHeader->addWidget(objectsTitle);
+  objectsHeader->addStretch();
+  objectsFold_ = new QToolButton(objectsCard_);
+  objectsFold_->setObjectName("objectsFold");
+  objectsFold_->setArrowType(Qt::DownArrow);
+  objectsFold_->setToolTip("折叠处理对象卡片");
+  objectsFold_->setAccessibleName("折叠处理对象卡片");
+  objectsFold_->setCheckable(true);
+  objectsFold_->setAutoRaise(true);
+  objectsFold_->setFixedSize(24, 22);
+  objectsHeader->addWidget(objectsFold_);
+  box(objectsCard_)->addLayout(objectsHeader);
+  objectsContent_ = new QWidget(objectsCard_);
+  auto *contentLayout = new QVBoxLayout(objectsContent_);
+  contentLayout->setContentsMargins(0, 0, 0, 0);
+  contentLayout->setSpacing(4);
+  box(objectsCard_)->addWidget(objectsContent_);
+  connect(objectsFold_, &QToolButton::toggled, this, [this](bool collapsed) {
+    objectsContent_->setVisible(!collapsed);
+    box(objectsCard_)->setContentsMargins(6, 5, 6, collapsed ? 5 : 14);
+    objectsResizeGrip_->setVisible(!collapsed);
+    objectsFold_->setArrowType(collapsed ? Qt::RightArrow : Qt::DownArrow);
+    objectsFold_->setToolTip(collapsed ? "展开处理对象卡片" : "折叠处理对象卡片");
+    objectsFold_->setAccessibleName(objectsFold_->toolTip());
+    arrange();
   });
-  objectsCard_ = card(canvas_, "处理对象");
-  box(objectsCard_)->setContentsMargins(9, 7, 9, 9);
-  auto *objectsHint = new QLabel("默认使用当前点云 · 多选可用于配准和比较", objectsCard_);
+  auto *objectsHint = new QLabel("当前地图 / 实时点云可直接取用；下方列出固定副本与导入对象", objectsContent_);
   objectsHint->setObjectName("mutedText");
   objectsHint->setWordWrap(true);
-  box(objectsCard_)->addWidget(objectsHint);
-  processingObjects_ = new QListWidget(objectsCard_);
+  contentLayout->addWidget(objectsHint);
+  processingObjects_ = new QListWidget(objectsContent_);
   processingObjects_->setObjectName("processingObjects");
   processingObjects_->setSelectionMode(QAbstractItemView::ExtendedSelection);
   processingObjects_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   processingObjects_->setTextElideMode(Qt::ElideMiddle);
   processingObjects_->setMinimumHeight(160);
-  box(objectsCard_)->addWidget(processingObjects_);
+  processingObjects_->setContextMenuPolicy(Qt::CustomContextMenu);
+  processingObjects_->setStyleSheet(
+      "QListWidget#processingObjects{border:0;border-radius:4px;"
+      "background:rgba(255,255,255,215);}");
+  contentLayout->addWidget(processingObjects_);
   connect(processingObjects_, &QListWidget::itemSelectionChanged, this, [this] {
     auto *root = window_->dbRootObject();
     if (!root)
@@ -1670,18 +1923,32 @@ void MissionController::buildUi() {
     }
     window_->db()->selectEntities(selectedObjects);
   });
-  button(box(objectsCard_), "＋ 导入文件", [this] { importProcessingFiles(); });
-  processingCard_ = card(canvas_, "处理工具");
+  connect(processingObjects_, &QWidget::customContextMenuRequested, this,
+          &MissionController::showProcessingObjectMenu);
+  auto *objectActions = new QHBoxLayout;
+  contentLayout->addLayout(objectActions);
+  button(objectActions, "当前点云", [this] { selectCurrentCloud(); });
+  button(objectActions, "快照", [this] { snapshotMap(); });
+  objectsResizeGrip_ = new ProcessingResizeHandle(objectsCard_);
+  objectsResizeGrip_->setObjectName("objectsResizeGrip");
+  objectsResizeGrip_->setToolTip("拖动调整处理对象卡片大小");
+  objectsResizeGrip_->setAccessibleName("调整处理对象卡片大小");
+  objectsResizeGrip_->installEventFilter(this);
+  processingCard_ = card(rightContents, "点云工具");
+  detailsLayout->addWidget(processingCard_);
   box(processingCard_)->setContentsMargins(9, 7, 9, 9);
-  processingHint_ = new QLabel("进入处理区后自动选中当前点云的固定副本。", processingCard_);
+  processingHint_ = new QLabel("选择对象；未选中时处理工具使用当前点云的固定副本。", processingCard_);
   processingHint_->setObjectName("mutedText");
   processingHint_->setWordWrap(true);
   box(processingCard_)->addWidget(processingHint_);
-  processingOnly_ = new QWidget(processingCard_);
+  toolsTabs_ = new QTabWidget(processingCard_);
+  toolsTabs_->setObjectName("missionToolsTabs");
+  box(processingCard_)->addWidget(toolsTabs_);
+  processingOnly_ = new QWidget(toolsTabs_);
   auto *processingActions = new QVBoxLayout(processingOnly_);
   processingActions->setContentsMargins(0, 0, 0, 0);
   processingActions->setSpacing(4);
-  box(processingCard_)->addWidget(processingOnly_);
+  toolsTabs_->addTab(processingOnly_, "处理");
   auto addCardTool = [this](QVBoxLayout *layout, const QString &label,
                             const char *name) {
     button(layout, label, [this, name] {
@@ -1693,7 +1960,7 @@ void MissionController::buildUi() {
   addCardTool(processingActions, "计算法向量", "actionComputeNormals");
   button(processingActions, "一键生成数模（泊松）", [this] { quickReconstruct(); });
   addCardTool(processingActions, "栅格化", "actionRasterize");
-  comparisonOnly_ = new QWidget(processingCard_);
+  comparisonOnly_ = new QWidget(toolsTabs_);
   auto *comparisonActions = new QVBoxLayout(comparisonOnly_);
   comparisonActions->setContentsMargins(0, 0, 0, 0);
   comparisonActions->setSpacing(4);
@@ -1710,14 +1977,21 @@ void MissionController::buildUi() {
   addCardTool(comparisonActions, "ICP 配准…", "actionRegister");
   addCardTool(comparisonActions, "点云到点云距离…", "actionCloudCloudDist");
   addCardTool(comparisonActions, "点云到网格距离…", "actionCloudMeshDist");
-  box(processingCard_)->addWidget(comparisonOnly_);
-  comparisonOnly_->hide();
-  processingToolbar_->hide();
-  objectsCard_->hide();
-  processingCard_->hide();
+  toolsTabs_->addTab(comparisonOnly_, "对比");
+  connect(toolsTabs_, &QTabWidget::currentChanged, this, [this](int index) {
+    if (index == 1)
+      selectComparisonPair();
+  });
+  button(box(processingCard_), "导出选中对象", [this] {
+    runCloudCompareAction("actionSave");
+  });
+  detailsLayout->addStretch(1);
+  detailsScroll_->setWidget(rightContents);
   left_->show();
   right_->show();
   top_->show();
+  objectsCard_->show();
+  processingCard_->show();
   mapBadge_->show();
   gl_->setView(CC_ISO_VIEW_1);
   window_->statusBar()->showMessage("地图坐标：" + frame_ + "　·　单位：m");
@@ -1725,91 +1999,127 @@ void MissionController::buildUi() {
   protocolHint_->setObjectName("mutedText");
   window_->statusBar()->addPermanentWidget(protocolHint_);
   for (auto *cardWidget : {left_, mapPopover_, heightFilterPanel_, top_, editor_, h, s, o,
-                           processingToolbar_, objectsCard_, processingCard_}) {
+                           objectsCard_, processingCard_}) {
     auto *shadow = new QGraphicsDropShadowEffect(cardWidget);
     shadow->setBlurRadius(22);
     shadow->setOffset(0, 4);
     shadow->setColor(QColor(7, 26, 37, 53));
     cardWidget->setGraphicsEffect(shadow);
   }
+  auto registerCard = [this, display](QWidget *widget, const QString &name,
+                                       std::function<void(bool)> setShown = {}) {
+    auto *action = display->addAction(name);
+    action->setCheckable(true);
+    action->setChecked(!widget->isHidden());
+    cardVisibilityActions_.insert(widget, action);
+    widget->installEventFilter(this);
+    connect(action, &QAction::toggled, this, [widget, setShown](bool shown) {
+      if (setShown)
+        setShown(shown);
+      else
+        widget->setVisible(shown);
+      if (shown && widget->isVisible())
+        widget->raise();
+    });
+    widget->setContextMenuPolicy(Qt::CustomContextMenu);
+    auto showHideMenu = [widget, action](const QPoint &point) {
+      QMenu menu(widget);
+      auto *hide = menu.addAction("隐藏此卡片");
+      if (menu.exec(widget->mapToGlobal(point)) == hide)
+        action->setChecked(false);
+    };
+    connect(widget, &QWidget::customContextMenuRequested, this, showHideMenu);
+    return action;
+  };
+  registerCard(top_, "顶部工具栏");
+  registerCard(left_, "图层工具栏");
+  registerCard(mapBadge_, "地图状态");
+  registerCard(editor_, "航点任务");
+  registerCard(objectsCard_, "处理对象", [this](bool shown) {
+    objectsButton_->setChecked(shown);
+  });
+  registerCard(mapPopover_, "当前地图");
+  registerCard(heightFilterPanel_, "高度过滤", [this](bool shown) {
+    heightFilterButton_->setChecked(shown);
+  });
+  registerCard(h, "无人机 HUD");
+  registerCard(sensorCard, "Odin1 视场与图像");
+  registerCard(s, "任务机状态信息");
+  registerCard(o, "任务机操作");
+  registerCard(processingCard_, "点云工具", [this, showTools](bool shown) {
+    showTools->setChecked(shown);
+    if (shown)
+      detailsScroll_->verticalScrollBar()->setValue(processingCard_->y());
+  });
+  registerCard(replayDock, "bag 回放工具栏");
+  registerCard(logPopup_, "运行日志", [this](bool shown) {
+    if (shown)
+      latest_->click();
+    else
+      logPopup_->hide();
+  });
+  auto *videoAction = registerCard(video_, "视频窗口", [this](bool shown) {
+    if (shown) {
+      showVideo();
+    } else {
+      videoRetry_.stop();
+      player_->stop();
+      video_->hide();
+      refreshMediaButtons();
+    }
+  });
+  videoWidget_->setContextMenuPolicy(Qt::CustomContextMenu);
+  connect(videoWidget_, &QWidget::customContextMenuRequested, this,
+          [videoAction, this](const QPoint &point) {
+            QMenu menu(videoWidget_);
+            auto *hide = menu.addAction("隐藏此卡片");
+            if (menu.exec(videoWidget_->mapToGlobal(point)) == hide)
+              videoAction->setChecked(false);
+          });
+  display->addSeparator();
+  display->addAction("清空累积地图", this, [this] { clearAccumulatedMap(); });
   auto *objectRefresh = new QTimer(this);
   objectRefresh->setInterval(900);
   connect(objectRefresh, &QTimer::timeout, this,
           &MissionController::refreshProcessingObjects);
   objectRefresh->start();
 }
-void MissionController::setWorkspace(Workspace workspace, bool captureCurrentCloud) {
-  const Workspace previous = workspace_;
-  workspace_ = workspace;
-  const bool monitor = workspace == Workspace::Monitor;
-  if (!monitor && picking_ && picking_->isChecked())
-    picking_->setChecked(false);
-  if (!monitor && routeDialog_)
-    routeDialog_->hide();
-  if (mapPopover_)
-    mapPopover_->hide();
-  for (QWidget *widget : QVector<QWidget *>{left_, right_, top_, editor_, mapBadge_})
-    widget->setVisible(monitor);
-  heightFilterPanel_->setVisible(monitor && heightFilterButton_->isChecked());
-  for (auto *widget : {objectsCard_, processingCard_, processingToolbar_})
-    widget->setVisible(!monitor);
-  processingOnly_->setVisible(workspace == Workspace::Processing);
-  comparisonOnly_->setVisible(workspace == Workspace::Comparison);
-  if (auto *action = workspaceActions_.value(static_cast<int>(workspace)))
-    action->setChecked(true);
-  if (!monitor) {
-    auto *title = processingCard_->findChild<QLabel *>("cardTitle");
-    if (title)
-      title->setText(workspace == Workspace::Comparison ? "对比分析" : "处理工具");
-    processingHint_->setText(
-        workspace == Workspace::Comparison
-            ? "选择两个对象，使用 ICP 配准或计算点云距离。"
-            : "默认使用当前点云；工具使用 CloudCompare 原有算法与对话框。");
-    if (workspace == Workspace::Processing && captureCurrentCloud &&
-        (previous != Workspace::Processing || window_->getSelectedEntities().empty())) {
-      if (dirty_ && (mapDirty_ || liveDirty_))
-        updateScene();
-      const bool fromMap = map_ && map_->isEnabled() &&
-                           !mapPoints_.isEmpty();
-      const bool fromLive = live_ && live_->isEnabled() &&
-                            !livePoints_.isEmpty();
-      if (fromMap || fromLive) {
-        const quint64 version = fromMap ? mapCloudVersion_ : liveCloudVersion_;
-        ccHObject *cloud = automaticCloudId_ &&
-                                   automaticCloudFromMap_ == fromMap &&
-                                   automaticCloudVersion_ == version
-                               ? window_->dbRootObject()->find(automaticCloudId_)
-                               : nullptr;
-        if (!cloud) {
-          const QString name =
-              QString("当前%1_%2")
-                  .arg(fromMap ? "地图" : "实时点云",
-                       QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
-          cloud = captureSceneCloud(name, false);
-          if (cloud) {
-            automaticCloudId_ = cloud->getUniqueID();
-            automaticCloudFromMap_ = fromMap;
-            automaticCloudVersion_ = version;
-          }
-        }
-        if (cloud) {
-          window_->db()->selectEntities({cloud});
-          processingHint_->setText(
-              "已选中当前点云的固定副本；实时更新后重新进入处理区可取最新数据。");
-        }
-      } else {
-        window_->db()->selectEntities(ccHObject::Container{});
-        processingHint_->setText("当前界面没有可见点云；可等待实时数据或加载地图。");
-      }
-    }
-    refreshProcessingObjects();
-    if (workspace == Workspace::Comparison)
-      selectComparisonPair();
+bool MissionController::selectCurrentCloud() {
+  if (dirty_ && (mapDirty_ || liveDirty_))
+    updateScene();
+  const bool fromMap = map_ && map_->isEnabled() && !mapPoints_.isEmpty();
+  const bool fromLive = live_ && live_->isEnabled() && !livePoints_.isEmpty();
+  if (!fromMap && !fromLive) {
+    processingHint_->setText("当前界面没有可见点云；可等待实时数据或加载地图。");
+    return false;
   }
-  arrange();
+  const quint64 version = fromMap ? mapCloudVersion_ : liveCloudVersion_;
+  auto *dbRoot = window_->dbRootObject();
+  ccHObject *cloud = dbRoot && automaticCloudId_ &&
+                             automaticCloudFromMap_ == fromMap &&
+                             automaticCloudVersion_ == version
+                         ? dbRoot->find(automaticCloudId_)
+                         : nullptr;
+  if (!cloud) {
+    const QString name = QString("当前%1_%2")
+                             .arg(fromMap ? "地图" : "实时点云",
+                                  QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
+    cloud = captureSceneCloud(name, false);
+    if (!cloud)
+      return false;
+    automaticCloudId_ = cloud->getUniqueID();
+    automaticCloudFromMap_ = fromMap;
+    automaticCloudVersion_ = version;
+  }
+  window_->db()->selectEntities({cloud});
+  refreshProcessingObjects();
+  processingHint_->setText("已选中当前点云的固定副本；再次取用可获取更新后的点云。");
+  if (objectsButton_)
+    objectsButton_->setChecked(true);
+  return true;
 }
 void MissionController::refreshProcessingObjects() {
-  if (!processingObjects_ || workspace_ == Workspace::Monitor)
+  if (!processingObjects_)
     return;
   auto *root = window_->dbRootObject();
   if (!root)
@@ -1843,7 +2153,9 @@ void MissionController::refreshProcessingObjects() {
     }
   }
   QSet<unsigned> selectedIds;
-  for (auto *object : window_->getSelectedEntities())
+  ccHObject::Container liveSelection;
+  window_->db()->getSelectedEntities(liveSelection);
+  for (auto *object : liveSelection)
     selectedIds.insert(object->getUniqueID());
   QSignalBlocker blocked(processingObjects_);
   if (changed) {
@@ -1890,26 +2202,159 @@ void MissionController::refreshProcessingObjects() {
   if (objects.isEmpty())
     processingHint_->setText("当前界面没有可处理的点云；可等待实时数据或加载地图。");
 }
-void MissionController::selectComparisonPair() {
-  if (workspace_ != Workspace::Comparison || !processingObjects_)
+QVector<ccHObject *> MissionController::selectedProcessingObjects() const {
+  QVector<ccHObject *> selected;
+  auto *root = window_->dbRootObject();
+  if (!root || !processingObjects_)
+    return selected;
+  for (auto *item : processingObjects_->selectedItems()) {
+    if (auto *object = root->find(item->data(Qt::UserRole).toUInt()))
+      selected.push_back(object);
+  }
+  return selected;
+}
+void MissionController::showProcessingObjectMenu(const QPoint &position) {
+  auto *item = processingObjects_->itemAt(position);
+  if (item && !item->isSelected())
+    processingObjects_->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+  else if (!item)
+    processingObjects_->clearSelection();
+
+  const auto selected = selectedProcessingObjects();
+  const bool canCopy = !selected.isEmpty() &&
+      std::all_of(selected.cbegin(), selected.cend(), canCopyProcessingObject);
+  const bool canDelete = !selected.isEmpty() &&
+      std::all_of(selected.cbegin(), selected.cend(), [](ccHObject *object) {
+        return object->getParent() && !object->isLocked();
+      });
+  QMenu menu(processingObjects_);
+  auto *copy = menu.addAction("复制");
+  copy->setEnabled(canCopy);
+  auto *paste = menu.addAction("粘贴");
+  paste->setEnabled(!objectClipboard_.empty());
+  auto *rename = menu.addAction("重命名");
+  rename->setEnabled(selected.size() == 1 && !selected.front()->isLocked());
+  menu.addSeparator();
+  auto *remove = menu.addAction("删除");
+  remove->setEnabled(canDelete);
+  auto *chosen = menu.exec(processingObjects_->viewport()->mapToGlobal(position));
+  if (chosen == copy)
+    copyProcessingObjects();
+  else if (chosen == paste)
+    pasteProcessingObjects();
+  else if (chosen == rename)
+    renameProcessingObject();
+  else if (chosen == remove)
+    deleteProcessingObjects();
+}
+void MissionController::copyProcessingObjects() {
+  const auto selected = selectedProcessingObjects();
+  if (selected.isEmpty())
     return;
+  std::vector<std::unique_ptr<ccHObject>> copies;
+  for (auto *object : selected) {
+    if (!canCopyProcessingObject(object))
+      return;
+    auto copy = cloneProcessingObject(object);
+    if (!copy) {
+      log("复制处理对象失败：无法创建完整副本", "点云处理");
+      return;
+    }
+    copies.push_back(std::move(copy));
+  }
+  objectClipboard_ = std::move(copies);
+  log(QString("已复制 %1 个处理对象").arg(objectClipboard_.size()), "点云处理");
+}
+void MissionController::pasteProcessingObjects() {
+  if (objectClipboard_.empty())
+    return;
+  std::vector<std::unique_ptr<ccHObject>> copies;
+  for (const auto &source : objectClipboard_) {
+    auto copy = cloneProcessingObject(source.get());
+    if (!copy) {
+      log("粘贴处理对象失败：无法创建完整副本", "点云处理");
+      return;
+    }
+    copy->setName(source->getName() + "_副本");
+    copy->setDisplay_recursive(gl_);
+    copy->setVisible(true);
+    copy->setEnabled(true);
+    copies.push_back(std::move(copy));
+  }
+  ccHObject::Container pasted;
+  for (auto &copy : copies) {
+    auto *object = copy.release();
+    window_->addToDB(object, false, true, false, true);
+    pasted.push_back(object);
+  }
+  window_->db()->selectEntities(pasted);
+  refreshProcessingObjects();
+  objectsButton_->setChecked(true);
+  log(QString("已粘贴 %1 个处理对象").arg(pasted.size()), "点云处理");
+}
+void MissionController::renameProcessingObject() {
+  const auto selected = selectedProcessingObjects();
+  if (selected.size() != 1 || selected.front()->isLocked())
+    return;
+  auto *object = selected.front();
+  bool accepted = false;
+  const QString name = QInputDialog::getText(
+      window_, "重命名处理对象", "名称", QLineEdit::Normal,
+      object->getName(), &accepted).trimmed();
+  if (!accepted || name.isEmpty() || name == object->getName())
+    return;
+  if (window_->db()->setData(window_->db()->index(object), name, Qt::EditRole)) {
+    refreshProcessingObjects();
+    log("已重命名处理对象：" + name, "点云处理");
+  }
+}
+void MissionController::deleteProcessingObjects() {
+  const auto selected = selectedProcessingObjects();
+  if (selected.isEmpty() ||
+      !std::all_of(selected.cbegin(), selected.cend(), [](ccHObject *object) {
+        return object->getParent() && !object->isLocked();
+      }))
+    return;
+  const QString question = selected.size() == 1
+      ? QString("确定删除“%1”？").arg(selected.front()->getName())
+      : QString("确定删除选中的 %1 个处理对象？").arg(selected.size());
+  if (QMessageBox::question(window_, "删除处理对象", question,
+                            QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No) != QMessageBox::Yes)
+    return;
+  ccHObject::Container objects(selected.cbegin(), selected.cend());
+  window_->db()->selectEntities(objects);
+  window_->db()->deleteSelectedEntities();
+  if (automaticCloudId_ && !window_->dbRootObject()->find(automaticCloudId_))
+    automaticCloudId_ = 0;
+  refreshProcessingObjects();
+  log(QString("已删除 %1 个处理对象").arg(selected.size()), "点云处理");
+}
+bool MissionController::selectComparisonPair() {
+  if (!processingObjects_ || toolsTabs_->currentWidget() != comparisonOnly_)
+    return false;
   const unsigned reference = referenceObject_->currentData().toUInt();
   const unsigned target = targetObject_->currentData().toUInt();
   if (!reference || !target || reference == target) {
     processingHint_->setText("参考和待测必须是两个不同对象。");
-    return;
+    return false;
   }
   auto *root = window_->dbRootObject();
   if (!root)
-    return;
+    return false;
   ccHObject::Container pair;
   if (auto *object = root->find(reference))
     pair.push_back(object);
   if (auto *object = root->find(target))
     pair.push_back(object);
+  if (pair.size() != 2) {
+    processingHint_->setText("参考或待测对象已不存在，请重新选择。");
+    return false;
+  }
   window_->db()->selectEntities(pair);
   refreshProcessingObjects();
   processingHint_->setText("已选择参考与待测对象；距离方向可在原工具对话框确认。");
+  return true;
 }
 void MissionController::importProcessingFiles() {
   QSettings settings("3DG", "Mission");
@@ -1920,8 +2365,8 @@ void MissionController::importProcessingFiles() {
     return;
   settings.setValue("processingDir", QFileInfo(paths.first()).absolutePath());
   window_->addToDB(paths, QString(), gl_);
-  setWorkspace(Workspace::Processing, false);
   refreshProcessingObjects();
+  objectsButton_->setChecked(true);
   log(QString("已请求导入 %1 个处理文件").arg(paths.size()), "点云处理");
 }
 ccPointCloud *MissionController::captureSceneCloud(const QString &name,
@@ -1965,13 +2410,14 @@ void MissionController::snapshotMap() {
           .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
   if (!cloud)
     return;
-  setWorkspace(Workspace::Processing, false);
   window_->db()->selectEntities({cloud});
   refreshProcessingObjects();
+  objectsButton_->setChecked(true);
 }
 void MissionController::quickReconstruct() {
-  if (window_->getSelectedEntities().empty())
-    setWorkspace(Workspace::Processing);
+  toolsTabs_->setCurrentWidget(processingOnly_);
+  if (window_->getSelectedEntities().empty() && !selectCurrentCloud())
+    return;
   const auto &selected = window_->getSelectedEntities();
   if (selected.size() != 1 || !selected.front()->isA(CC_TYPES::POINT_CLOUD)) {
     processingHint_->setText("请在处理对象中只选中一份点云。");
@@ -2006,9 +2452,21 @@ void MissionController::quickReconstruct() {
   log("当前构建未加载泊松重建插件", "点云处理");
 }
 void MissionController::runCloudCompareAction(const char *objectName) {
-  if (window_->getSelectedEntities().empty())
-    setWorkspace(Workspace::Processing);
-  auto *action = window_->findChild<QAction *>(QString::fromLatin1(objectName));
+  const QString actionId = QString::fromLatin1(objectName);
+  const bool pairTool = actionId == "actionRegister" ||
+                        actionId == "actionPointPairsAlign" ||
+                        actionId == "actionCloudCloudDist" ||
+                        actionId == "actionCloudMeshDist";
+  if (pairTool) {
+    toolsTabs_->setCurrentWidget(comparisonOnly_);
+    if (!selectComparisonPair())
+      return;
+  } else if (actionId != "actionSave") {
+    toolsTabs_->setCurrentWidget(processingOnly_);
+    if (window_->getSelectedEntities().empty() && !selectCurrentCloud())
+      return;
+  }
+  auto *action = window_->findChild<QAction *>(actionId);
   if (!action) {
     log(QString("当前构建不包含工具 %1").arg(objectName), "点云处理");
     return;
@@ -2030,6 +2488,246 @@ void MissionController::runCloudCompareAction(const char *objectName) {
   }
   action->trigger();
   QTimer::singleShot(0, this, &MissionController::refreshProcessingObjects);
+}
+void MissionController::configureNoiseDetection() {
+  QDialog dialog(window_);
+  dialog.setWindowTitle("噪点检测参数");
+  dialog.setMinimumWidth(370);
+  auto *layout = new QVBoxLayout(&dialog);
+  auto *form = new QFormLayout;
+  layout->addLayout(form);
+  auto *knn = new QSpinBox(&dialog);
+  knn->setObjectName("noiseKnn");
+  knn->setRange(3, 256);
+  knn->setValue(noiseKnn_);
+  knn->setToolTip("每个点用于计算平均邻距的近邻数量；点云点数须大于此值");
+  form->addRow("近邻点数 K", knn);
+  auto *sigma = new QDoubleSpinBox(&dialog);
+  sigma->setObjectName("noiseSigma");
+  sigma->setRange(0.1, 10.0);
+  sigma->setDecimals(2);
+  sigma->setSingleStep(0.1);
+  sigma->setValue(noiseSigma_);
+  sigma->setToolTip("平均邻距超过全局均值加此倍数标准差的点会标为噪点");
+  form->addRow("标准差倍数 σ", sigma);
+  auto *pointSize = new QSpinBox(&dialog);
+  pointSize->setObjectName("noisePointSize");
+  pointSize->setRange(2, 12);
+  pointSize->setValue(noisePointSize_);
+  form->addRow("噪点显示大小", pointSize);
+  auto *hint = new QLabel(
+      "保存后再次运行自动筛选生效。σ 越小，筛出的点通常越多；原始点云不修改。",
+      &dialog);
+  hint->setWordWrap(true);
+  layout->addWidget(hint);
+  auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok |
+                                       QDialogButtonBox::Cancel, &dialog);
+  buttons->button(QDialogButtonBox::Ok)->setText("保存");
+  buttons->button(QDialogButtonBox::Cancel)->setText("取消");
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  if (dialog.exec() != QDialog::Accepted)
+    return;
+  noiseKnn_ = knn->value();
+  noiseSigma_ = sigma->value();
+  noisePointSize_ = pointSize->value();
+  QSettings settings("3DG", "Mission");
+  settings.setValue("noiseKnn", noiseKnn_);
+  settings.setValue("noiseSigma", noiseSigma_);
+  settings.setValue("noisePointSize", noisePointSize_);
+  log(QString("噪点参数已保存：K=%1，σ=%2，显示大小=%3")
+          .arg(noiseKnn_).arg(noiseSigma_, 0, 'f', 2).arg(noisePointSize_),
+      "点云处理");
+}
+void MissionController::detectCloudNoise() {
+  toolsTabs_->setCurrentWidget(processingOnly_);
+  if (dirty_ && (mapDirty_ || liveDirty_ || colorMapDirty_))
+    updateScene();
+
+  ccPointCloud *source = nullptr;
+  const auto &selected = window_->getSelectedEntities();
+  if (!selected.empty()) {
+    if (selected.size() == 1)
+      source = dynamic_cast<ccPointCloud *>(selected.front());
+    if (!source) {
+      log("噪点检测：请只选中一份点云", "点云处理");
+      if (processingHint_)
+        processingHint_->setText("请只选中一份点云，再运行噪点检测。");
+      return;
+    }
+  } else {
+    for (ccHObject *layer : {map_, colorMap_, live_}) {
+      if (layer && layer->isEnabled() && layer->isVisible() &&
+          layer->getChildrenNumber()) {
+        source = dynamic_cast<ccPointCloud *>(layer->getChild(0));
+        if (source && source->size())
+          break;
+      }
+    }
+    if (!source && selected.size() == 1)
+      source = dynamic_cast<ccPointCloud *>(selected.front());
+  }
+  if (noiseViewActive_ && (!source || source->getUniqueID() == noiseResultId_)) {
+    auto *root = window_->dbRootObject();
+    source = root && noiseSourceId_
+                 ? dynamic_cast<ccPointCloud *>(root->find(noiseSourceId_))
+                 : nullptr;
+  }
+  const int knn = noiseKnn_;
+  const double sigma = noiseSigma_;
+  const int pointSize = noisePointSize_;
+  const unsigned minPoints = static_cast<unsigned>(qMax(8, knn + 1));
+  if (!source || source->size() < minPoints) {
+    log(QString("噪点检测：当前点云至少需要 %1 个点").arg(minPoints), "点云处理");
+    if (processingHint_)
+      processingHint_->setText(
+          QString("当前没有可检测的点云（至少需要 %1 个点）。").arg(minPoints));
+    return;
+  }
+  const QString sourceName = source->getName();
+
+  // The mission scene replaces its clouds as telemetry arrives. Work on a
+  // stable copy so the outlier indices and the displayed result always match.
+  std::unique_ptr<ccPointCloud> snapshot(source->cloneThis(nullptr, true));
+  if (!snapshot || snapshot->size() != source->size()) {
+    log("噪点检测：点云副本创建失败（内存不足）", "点云处理");
+    return;
+  }
+  snapshot->setName(sourceName + "_噪点原图_" +
+                    QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
+  snapshot->setDisplay(gl_);
+  snapshot->setVisible(true);
+
+  ccProgressDialog progress(true, window_);
+  progress.setAutoClose(false);
+  std::unique_ptr<CCCoreLib::ReferenceCloud> retained(
+      CCCoreLib::CloudSamplingTools::sorFilter(snapshot.get(), knn, sigma,
+                                               nullptr, &progress));
+  if (!retained) {
+    log(progress.wasCanceled() ? "噪点检测已取消" : "噪点检测失败", "点云处理");
+    return;
+  }
+  const unsigned noiseCount = snapshot->size() - retained->size();
+  if (!noiseCount) {
+    restoreCloudNoiseView();
+    noiseSourceId_ = noiseResultId_ = 0;
+    for (auto *action : {noiseOverlayAction_, noiseOnlyAction_, noiseRestoreAction_})
+      action->setEnabled(false);
+    const QString message = "噪点检测完成：未发现离群点";
+    log(message, "点云处理");
+    if (processingHint_)
+      processingHint_->setText(message);
+    return;
+  }
+
+  std::vector<unsigned char> retainedMask(snapshot->size(), 0);
+  for (unsigned i = 0; i < retained->size(); ++i)
+    retainedMask[retained->getPointGlobalIndex(i)] = 1;
+  CCCoreLib::ReferenceCloud outliers(snapshot.get());
+  if (!outliers.reserve(noiseCount)) {
+    log("噪点检测：无法分配噪点索引内存", "点云处理");
+    return;
+  }
+  for (unsigned i = 0; i < snapshot->size(); ++i) {
+    if (!retainedMask[i] && !outliers.addPointIndex(i)) {
+      log("噪点检测：无法生成噪点索引", "点云处理");
+      return;
+    }
+  }
+  std::unique_ptr<ccPointCloud> noise(snapshot->partialClone(&outliers, nullptr, false));
+  if (!noise || !noise->setColor(ccColor::Rgb(255, 54, 54))) {
+    log("噪点检测：无法生成红色噪点图层（内存不足）", "点云处理");
+    return;
+  }
+  noise->setName(sourceName + "_噪点_" +
+                 QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
+  noise->setMetaData("3dg.noise.algorithm", "SOR");
+  noise->setMetaData("3dg.noise.knn", knn);
+  noise->setMetaData("3dg.noise.sigma", sigma);
+  noise->showSF(false);
+  noise->showColors(true);
+  noise->setPointSize(pointSize);
+  noise->setDisplay(gl_);
+  noise->setVisible(true);
+
+  restoreCloudNoiseView();
+  auto *snapshotObject = snapshot.release();
+  auto *noiseObject = noise.release();
+  window_->addToDB(snapshotObject, false, true, false, true);
+  window_->addToDB(noiseObject, false, true, false, true);
+  noiseSourceId_ = snapshotObject->getUniqueID();
+  noiseResultId_ = noiseObject->getUniqueID();
+  for (auto *action : {noiseOverlayAction_, noiseOnlyAction_, noiseRestoreAction_})
+    action->setEnabled(true);
+  showCloudNoise(false);
+  window_->db()->selectEntities({snapshotObject});
+  refreshProcessingObjects();
+  const QString message =
+      QString("噪点检测完成：%1 / %2 个点被标为离群点（SOR，K=%3，σ=%4）")
+          .arg(noiseCount).arg(snapshotObject->size()).arg(knn)
+          .arg(sigma, 0, 'f', 2);
+  log(message, "点云处理");
+  if (processingHint_)
+    processingHint_->setText(message);
+}
+void MissionController::showCloudNoise(bool onlyNoise) {
+  auto *root = window_->dbRootObject();
+  auto *snapshot = root && noiseSourceId_ ? root->find(noiseSourceId_) : nullptr;
+  auto *noise = root && noiseResultId_ ? root->find(noiseResultId_) : nullptr;
+  if (!snapshot || !noise) {
+    restoreCloudNoiseView();
+    noiseSourceId_ = noiseResultId_ = 0;
+    log("噪点图层已移除，请重新运行检测", "点云处理");
+    for (auto *action : {noiseOverlayAction_, noiseOnlyAction_, noiseRestoreAction_})
+      action->setEnabled(false);
+    return;
+  }
+  if (!noiseViewActive_) {
+    noiseDbVisibility_.clear();
+    for (unsigned i = 0; i < root->getChildrenNumber(); ++i) {
+      auto *object = root->getChild(i);
+      if (object != snapshot && object != noise)
+        noiseDbVisibility_.insert(object->getUniqueID(), object->isVisible());
+    }
+    for (unsigned i = 0; i < root_->getChildrenNumber(); ++i) {
+      auto *layer = root_->getChild(i);
+      noiseSceneVisibility_.insert(layer, layer->isEnabled());
+    }
+    noiseViewActive_ = true;
+  }
+  for (auto it = noiseDbVisibility_.cbegin(); it != noiseDbVisibility_.cend(); ++it) {
+    if (auto *object = root->find(it.key()))
+      object->setVisible(false);
+  }
+  for (auto it = noiseSceneVisibility_.cbegin(); it != noiseSceneVisibility_.cend(); ++it) {
+    const bool pointLayer = it.key() == map_ || it.key() == colorMap_ ||
+                            it.key() == live_;
+    it.key()->setEnabled(!onlyNoise && !pointLayer && it.value());
+  }
+  snapshot->setVisible(!onlyNoise);
+  noise->setVisible(true);
+  gl_->redraw();
+}
+void MissionController::restoreCloudNoiseView() {
+  auto *root = window_->dbRootObject();
+  if (root) {
+    if (auto *snapshot = noiseSourceId_ ? root->find(noiseSourceId_) : nullptr)
+      snapshot->setVisible(false);
+    if (auto *noise = noiseResultId_ ? root->find(noiseResultId_) : nullptr)
+      noise->setVisible(false);
+    for (auto it = noiseDbVisibility_.cbegin(); it != noiseDbVisibility_.cend(); ++it) {
+      if (auto *object = root->find(it.key()))
+        object->setVisible(it.value());
+    }
+  }
+  for (auto it = noiseSceneVisibility_.cbegin(); it != noiseSceneVisibility_.cend(); ++it)
+    it.key()->setEnabled(it.value());
+  noiseDbVisibility_.clear();
+  noiseSceneVisibility_.clear();
+  noiseViewActive_ = false;
+  if (gl_)
+    gl_->redraw();
 }
 void MissionController::refreshMapInfo() {
   if (mapInfo_)
@@ -2155,16 +2853,24 @@ void MissionController::arrange() {
   filterPosition.setY(qBound(0, filterPosition.y(), qMax(0, h - filterHeight)));
   heightFilterPanel_->setGeometry(QRect(filterPosition, QSize(filterWidth, filterHeight)));
   right_->setGeometry(w - rightWidth - margin, margin, rightWidth,
-                      right_->sizeHint().height());
+                      qMax(0, h - margin * 2));
   top_->setGeometry(centerX, margin,
                     toolbarCollapsed_ ? 44 : qMin(centerWidth, 450), 46);
-  objectsCard_->setGeometry(margin, margin + 58, 190,
-                            qMin(h - margin * 2 - 64, 320));
-  processingCard_->setGeometry(w - margin - 234, margin + 58, 234,
-                               qMin(h - margin * 2 - 64,
-                                    processingCard_->sizeHint().height()));
-  processingToolbar_->setGeometry(
-      qMax(210, (w - 450) / 2), margin, qMin(450, w - 440), 46);
+  const int objectsX = margin + leftWidth + 8;
+  const int objectsY = margin + 58;
+  const QSize objectsMinimum = objectsCard_->minimumSizeHint();
+  const int objectsWidth = qMin(qMax(qMax(180, objectsMinimum.width()),
+                                    objectsExpandedSize_.width()),
+                                qMax(0, w - objectsX - margin));
+  const int objectsHeight = objectsFold_->isChecked()
+      ? objectsCard_->sizeHint().height()
+      : qMin(qMax(qMax(260, objectsMinimum.height()),
+                  objectsExpandedSize_.height()),
+             qMax(0, h - objectsY - margin));
+  objectsCard_->setGeometry(objectsX, objectsY, objectsWidth, objectsHeight);
+  objectsResizeGrip_->move(qMax(0, objectsWidth - 15),
+                           qMax(0, objectsHeight - 14));
+  objectsResizeGrip_->raise();
   const int editorWidth = qMin(440, centerWidth - 4);
   const int editorHeight = qMin(h - margin * 2, editor_->sizeHint().height());
   const int editorX = centerX + (centerWidth - editorWidth) / 2;
@@ -2193,11 +2899,8 @@ void MissionController::arrange() {
   left_->raise();
   right_->raise();
   editor_->raise();
-  if (workspace_ != Workspace::Monitor) {
+  if (objectsCard_->isVisible())
     objectsCard_->raise();
-    processingCard_->raise();
-    processingToolbar_->raise();
-  }
   if (video_->isVisible())
     video_->raise();
   if (mapPopover_->isVisible())
@@ -2206,6 +2909,41 @@ void MissionController::arrange() {
     heightFilterPanel_->raise();
 }
 bool MissionController::eventFilter(QObject *o, QEvent *e) {
+  if ((e->type() == QEvent::Show || e->type() == QEvent::Hide) &&
+      cardVisibilityActions_.contains(o)) {
+    auto *widget = static_cast<QWidget *>(o);
+    cardVisibilityActions_.value(o)->setChecked(!widget->isHidden());
+  }
+  if (o == objectsResizeGrip_) {
+    if (e->type() == QEvent::MouseButtonPress) {
+      auto *mouse = static_cast<QMouseEvent *>(e);
+      if (mouse->button() == Qt::LeftButton) {
+        objectsResizePress_ = mouse->globalPos();
+        objectsResizeStart_ = objectsCard_->size();
+        objectsResizing_ = true;
+        objectsResizeGrip_->grabMouse();
+        return true;
+      }
+    } else if (e->type() == QEvent::MouseMove && objectsResizing_) {
+      auto *mouse = static_cast<QMouseEvent *>(e);
+      const QPoint delta = mouse->globalPos() - objectsResizePress_;
+      const int maxWidth = qMax(0, canvas_->width() - objectsCard_->x() - 12);
+      const int maxHeight = qMax(0, canvas_->height() - objectsCard_->y() - 12);
+      const QSize minimum = objectsCard_->minimumSizeHint();
+      objectsExpandedSize_ = QSize(
+          qMin(qMax(qMax(180, minimum.width()),
+                    objectsResizeStart_.width() + delta.x()), maxWidth),
+          qMin(qMax(qMax(260, minimum.height()),
+                    objectsResizeStart_.height() + delta.y()), maxHeight));
+      arrange();
+      return true;
+    } else if (e->type() == QEvent::MouseButtonRelease && objectsResizing_ &&
+               static_cast<QMouseEvent *>(e)->button() == Qt::LeftButton) {
+      objectsResizing_ = false;
+      objectsResizeGrip_->releaseMouse();
+      return true;
+    }
+  }
   if (o == heightFilterTitle_) {
     if (e->type() == QEvent::MouseButtonPress) {
       auto *mouse = static_cast<QMouseEvent *>(e);
@@ -2273,6 +3011,8 @@ bool MissionController::eventFilter(QObject *o, QEvent *e) {
     QTimer::singleShot(0, this, [this] { updateWaypointGizmo(); });
   if (o == window_->menuBar() && e->type() == QEvent::Resize && latest_)
     QTimer::singleShot(0, this, &MissionController::placeLatestLogButton);
+  if (o == window_ && e->type() == QEvent::Resize && bagReplayToolbar_)
+    bagReplayToolbar_->setWindowWidth(window_->width());
   if (o == video_ || o == videoWidget_) {
     QMouseEvent *m = nullptr;
     if (e->type() == QEvent::MouseButtonPress ||
@@ -2476,6 +3216,12 @@ void MissionController::makeLine(ccHObject *g, const QVector<QVector3D> &pts,
                                  unsigned char r, unsigned char green,
                                  unsigned char b, float width) {
   g->removeAllChildren();
+  addOverlayLine(g, pts, r, green, b, width);
+}
+void MissionController::addOverlayLine(ccHObject *g,
+                                       const QVector<QVector3D> &pts,
+                                       unsigned char r, unsigned char green,
+                                       unsigned char b, float width) {
   if (pts.isEmpty())
     return;
   auto *c = new ccPointCloud("vertices");
@@ -2720,6 +3466,176 @@ void MissionController::updateAircraftPose() {
     if (follow_->isChecked())
       gl_->setPivotPoint(CCVector3d(p.x(), p.y(), p.z()));
   }
+}
+void MissionController::updateOdinSensorPose(const mission::OdinSensorPose &pose) {
+  lastSensorPose_ = pose;
+  sensorAge_.restart();
+  rebuildOdinGeometry();
+  refreshOdinOverlayStatus();
+}
+void MissionController::refreshOdinOverlayStatus() {
+  if (!sensorOverlayStatus_)
+    return;
+  const bool poseFresh = sensorAge_.isValid() && sensorAge_.elapsed() <= 1500;
+  const bool projectionFresh = projectionAge_.isValid() &&
+                               projectionAge_.elapsed() <= 3000;
+  QString poseLine;
+  QString projectionLine;
+  QString detail;
+  if (!ready_) {
+    poseLine = "视场等待任务机连接";
+    projectionLine = "贴图等待同步图像";
+  } else if (!client_.odinProjectionSupported()) {
+    poseLine = "视场/贴图暂不可用";
+    projectionLine = "请更新任务机代理";
+  } else if (!poseFresh) {
+    poseLine = "相机/雷达位姿待更新";
+    projectionLine = projectionFresh
+                         ? QString("贴图 %1 点").arg(projectionPoints_.size())
+                         : QStringLiteral("贴图等待同步图像");
+  } else {
+    const auto &pose = lastSensorPose_;
+    poseLine = QString("相机%1 · 雷达%2 · 膨胀%3")
+                   .arg(pose.camera_valid() ? "✓" : "×")
+                   .arg(pose.lidar_valid() ? "✓" : "×")
+                   .arg(pose.inflation_valid()
+                            ? QString("%1m").arg(pose.inflation_m(), 0, 'f', 2)
+                            : QStringLiteral("待获取"));
+    projectionLine = projectionFresh
+                         ? QString("贴图 %1 点").arg(projectionPoints_.size())
+                         : QStringLiteral("贴图等待同步图像");
+    if (pose.inflation_valid()) {
+      projectionLine += pose.inflation_runtime() ? " · 运行参数" : " · 配置值";
+      detail = QString("EGO 膨胀 %1 m（%2）")
+                   .arg(pose.inflation_m(), 0, 'f', 2)
+                   .arg(pose.inflation_runtime() ? "运行参数" : "配置值");
+      if (pose.grid_resolution_m() > 0)
+        detail += QString("；显示半边 %1 m")
+                      .arg(std::ceil(pose.inflation_m() /
+                                     pose.grid_resolution_m()) *
+                                   pose.grid_resolution_m() +
+                                   pose.grid_resolution_m() / 2.0,
+                           0, 'f', 2);
+    }
+    detail = QString("相机：%1；雷达：%2\n%3\n图像贴合：%4 个点云落点")
+                 .arg(pose.camera_valid() ? "光学位姿已就绪" : "缺少 TF/标定")
+                 .arg(pose.lidar_valid() ? "TF 已就绪" : "缺少 TF")
+                 .arg(detail.isEmpty() ? "等待 EGO 膨胀参数" : detail)
+                 .arg(projectionFresh ? projectionPoints_.size() : 0);
+  }
+  sensorOverlayStatus_->setText(poseLine + '\n' + projectionLine);
+  sensorOverlayStatus_->setToolTip(detail);
+}
+void MissionController::updateOdinProjection(const mission::OdinProjection &projection) {
+  QString error;
+  projectionPoints_ = CloudIO::decode(
+      QByteArray::fromStdString(projection.point_data()), error);
+  if (!error.isEmpty()) {
+    log(error, "图像投影");
+    return;
+  }
+  makeCloud(imageProjection_, projectionPoints_, true, false);
+  if (imageProjection_->getChildrenNumber())
+    if (auto *cloud = dynamic_cast<ccPointCloud *>(imageProjection_->getChild(0)))
+      cloud->setPointSize(4);
+  // Sparse projector guide rays use the exact camera pose bundled with this
+  // image, and terminate at actual cloud points rather than a fixed plane.
+  const QVector3D camera = vec(projection.camera_position());
+  const int rayStep = qMax(1, projectionPoints_.size() / 6);
+  int rayCount = 0;
+  for (int i = 0; i < projectionPoints_.size() && rayCount < 6; i += rayStep) {
+    const auto &point = projectionPoints_[i];
+    const QVector3D end(point.x, point.y, point.z);
+    const float distance = (end - camera).length();
+    if (distance > .1f && distance < 8.0f) {
+      addOverlayLine(imageProjection_, {camera, end}, point.r, point.g,
+                     point.b, 1.4f);
+      ++rayCount;
+    }
+  }
+  projectionAge_.restart();
+  refreshOdinOverlayStatus();
+  if (gl_)
+    gl_->redraw();
+}
+void MissionController::clearOdinOverlays() {
+  sensorAge_.invalidate();
+  projectionAge_.invalidate();
+  lastSensorPose_.Clear();
+  projectionPoints_.clear();
+  for (auto *layer : {cameraFov_, lidarFov_, imageProjection_, aircraftInflation_})
+    if (layer)
+      layer->removeAllChildren();
+  refreshOdinOverlayStatus();
+  if (gl_)
+    gl_->redraw();
+}
+void MissionController::rebuildOdinGeometry() {
+  if (!gl_ || !sensorAge_.isValid() || sensorAge_.elapsed() > 1500)
+    return;
+  cameraFov_->removeAllChildren();
+  lidarFov_->removeAllChildren();
+  aircraftInflation_->removeAllChildren();
+  constexpr double deg = 3.14159265358979323846 / 180.0;
+  const auto drawFov = [this](ccHObject *layer, const mission::Vec3 &position,
+                              const mission::Quaternion &orientation,
+                              double horizontal, double vertical,
+                              bool optical, unsigned char r, unsigned char g,
+                              unsigned char b) {
+    const QVector3D origin = vec(position);
+    const QQuaternion rotation(orientation.w(), orientation.x(),
+                               orientation.y(), orientation.z());
+    const float dx = float(std::tan(horizontal * deg / 2.0));
+    const float dy = float(std::tan(vertical * deg / 2.0));
+    const float range = 1.8f;
+    QVector<QVector3D> corners;
+    for (int sy : {-1, 1})
+      for (int sx : {-1, 1}) {
+        const QVector3D local = optical
+            ? QVector3D(sx * dx, sy * dy, 1.0f)
+            : QVector3D(1.0f, sx * dx, sy * dy);
+        corners << origin + rotation.rotatedVector(local.normalized() * range);
+      }
+    for (const auto &corner : corners)
+      addOverlayLine(layer, {origin, corner}, r, g, b, 1.7f);
+    for (const auto &edge : {QPair<int,int>(0,1), {1,3}, {3,2}, {2,0}})
+      addOverlayLine(layer, {corners[edge.first], corners[edge.second]},
+                     r, g, b, 2.2f);
+    const QVector3D forward = optical ? QVector3D(0,0,1) : QVector3D(1,0,0);
+    addOverlayLine(layer,
+                   {origin, origin + rotation.rotatedVector(forward * range)},
+                   r, g, b, 1.2f);
+  };
+  if (lastSensorPose_.camera_valid())
+    drawFov(cameraFov_, lastSensorPose_.camera_position(),
+            lastSensorPose_.camera_orientation(), 129, 104, true,
+            kCameraFovColor.red, kCameraFovColor.green, kCameraFovColor.blue);
+  if (lastSensorPose_.lidar_valid())
+    drawFov(lidarFov_, lastSensorPose_.lidar_position(),
+            lastSensorPose_.lidar_orientation(), 120, 90, false,
+            kLidarFovColor.red, kLidarFovColor.green, kLidarFovColor.blue);
+  if (lastSensorPose_.inflation_valid() && lastVehicle_.pose_valid() &&
+      vehicleAge_.isValid() && vehicleAge_.elapsed() < 1500) {
+    // EGO inflates each occupied voxel by ceil(distance/resolution) steps on
+    // each world axis. This box is the equivalent point-robot collision volume.
+    const double step = lastSensorPose_.grid_resolution_m();
+    const float radius = float(std::ceil(lastSensorPose_.inflation_m() / step) *
+                               step + step / 2.0);
+    const QVector3D p = vec(lastVehicle_.position());
+    QVector<QVector3D> corners;
+    for (int z : {-1, 1})
+      for (int y : {-1, 1})
+        for (int x : {-1, 1})
+          corners << p + QVector3D(x * radius, y * radius, z * radius);
+    for (int i = 0; i < 8; ++i)
+      for (int bit : {1, 2, 4})
+        if (!(i & bit))
+          addOverlayLine(aircraftInflation_, {corners[i], corners[i | bit]},
+                         kAircraftInflationColor.red,
+                         kAircraftInflationColor.green,
+                         kAircraftInflationColor.blue, 2.0f);
+  }
+  gl_->redraw();
 }
 void MissionController::focusAircraft() {
   if (!gl_ || !lastVehicle_.pose_valid()) {

@@ -39,6 +39,24 @@ message VoxelGrid {
   uint64 version = 6; uint64 base_version = 7; bool delta = 8;
   repeated Vec3 added = 9; repeated Vec3 removed = 10;
 }
+// Poses use the same world frame as CloudFrame. Camera axes are optical
+// (+Z forward, +X right, +Y down); lidar axes follow Odin FLU.
+message OdinSensorPose {
+  string frame_id = 1; string map_id = 2; uint64 sample_time_ns = 3;
+  Vec3 camera_position = 4; Quaternion camera_orientation = 5;
+  Vec3 lidar_position = 6; Quaternion lidar_orientation = 7;
+  double inflation_m = 8; double grid_resolution_m = 9;
+  bool inflation_valid = 10;
+  bool camera_valid = 11; bool lidar_valid = 12;
+  bool inflation_runtime = 13;
+}
+// Image pixels sampled only at visible 3-D cloud points. Same LE16 layout as
+// CloudFrame; no image rectangle is displayed at an arbitrary depth plane.
+message OdinProjection {
+  string frame_id = 1; string map_id = 2; uint64 capture_time_ns = 3;
+  uint32 point_count = 4; bytes point_data = 5;
+  Vec3 camera_position = 6; Quaternion camera_orientation = 7;
+}
 message PlannerTrajectory {
   enum State { VALID = 0; FAILED = 1; CANCELLED = 2; }
   string trajectory_id = 1; string frame_id = 2; string map_id = 3;
@@ -61,12 +79,24 @@ message Command {
     VIDEO_START = 4; VIDEO_STOP = 5; RECORD_START = 6; RECORD_STOP = 7;
     SAVE_MAP = 8; GET_CONFIG = 9; SET_CONFIG = 10; UPLOAD_MISSION = 11; GET_FILE = 12;
     GET_YAML_CATALOG = 13; GET_YAML_DOCUMENT = 14; PATCH_YAML_DOCUMENT = 15;
-    GET_ODIN_MAPS = 16; GET_TIME = 17; SET_TIME = 18; SET_TASK_MODE = 19; }
+    GET_ODIN_MAPS = 16; GET_TIME = 17; SET_TIME = 18; SET_TASK_MODE = 19;
+    REPLAY_START = 20; REPLAY_PAUSE = 21; REPLAY_RESUME = 22;
+    REPLAY_SEEK = 23; REPLAY_STOP = 24; REPLAY_SPEED = 25;
+    GET_REPLAY_STATUS = 26; }
   Kind kind = 1; Config config = 2; MissionPlan mission = 3; string file_id = 4;
   string yaml_document_id = 5; string yaml_revision = 6; string yaml_patch_json = 7;
   OdinStart odin_start = 8;
   uint64 unix_time_ns = 9; // SET_TIME: 3DG computer's current Unix time.
   TaskMode task_mode = 10; // SET_TASK_MODE: select the task-machine workflow.
+  string replay_bag_id = 11; // Completed mission3dg bag basename, without suffix.
+  double replay_seconds = 12; // Seek position relative to the first Odin sample.
+  double replay_speed = 13; // 0.25 to 4.0; zero means default speed on start.
+}
+message ReplayStatus {
+  enum State { LIVE = 0; PLAYING = 1; PAUSED = 2; ENDED = 3; ERROR = 4; }
+  State state = 1; string bag_id = 2; double position_seconds = 3;
+  double duration_seconds = 4; double speed = 5; uint64 epoch = 6;
+  string detail = 7;
 }
 message OdinStart {
   enum Mode { ODOMETRY = 0; SLAM = 1; RELOCALIZATION = 2; }
@@ -103,6 +133,9 @@ message FileChunk {
 message Envelope {
   uint32 protocol_version = 1; string session_id = 2; uint64 sequence = 3;
   string request_id = 4; uint64 timestamp_ns = 5; string time_domain = 6;
+  // Data samples carry the source generation. Clients discard samples from a
+  // different replay epoch, including late frames from another WS channel.
+  uint64 source_epoch = 7;
   oneof payload {
     Hello hello = 10; Heartbeat heartbeat = 11; VehicleState vehicle = 12;
     CompanionStatus status = 13; CloudFrame cloud = 14;
@@ -112,5 +145,8 @@ message Envelope {
     VoxelGrid grid = 22;
     YamlCatalog yaml_catalog = 23; YamlDocument yaml_document = 24;
     OdinMapCatalog odin_maps = 25;
+    ReplayStatus replay_status = 26;
+    OdinSensorPose sensor_pose = 27;
+    OdinProjection projection = 28;
   }
 }

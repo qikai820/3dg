@@ -152,6 +152,36 @@ int main(int argc, char **argv) {
   grid->clear_centers();
   grid->mutable_added(0)->set_x(std::numeric_limits<double>::infinity());
   CHECK(!ProtocolClient::validate(e).isEmpty());
+  auto *sensor = e.mutable_sensor_pose();
+  sensor->set_frame_id("odom");
+  sensor->set_map_id("map");
+  sensor->set_sample_time_ns(123);
+  sensor->mutable_camera_orientation()->set_w(1);
+  sensor->mutable_lidar_orientation()->set_w(1);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  sensor->set_camera_valid(true);
+  sensor->mutable_camera_orientation()->set_w(0);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  sensor->mutable_camera_orientation()->set_w(1);
+  sensor->set_camera_valid(false);
+  sensor->set_lidar_valid(true);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  sensor->set_inflation_valid(true);
+  sensor->set_inflation_m(.45);
+  sensor->set_grid_resolution_m(.1);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  sensor->set_grid_resolution_m(0);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  auto *projection = e.mutable_projection();
+  projection->set_frame_id("odom");
+  projection->set_map_id("map");
+  projection->set_capture_time_ns(123);
+  projection->mutable_camera_orientation()->set_w(1);
+  projection->set_point_count(1);
+  projection->set_point_data(std::string(16, '\0'));
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  projection->set_point_count(2);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
   auto *yamlDocument = e.mutable_yaml_document();
   yamlDocument->set_id("ego");
   yamlDocument->set_revision(std::string(64, 'a'));
@@ -185,6 +215,24 @@ int main(int argc, char **argv) {
   CHECK(ProtocolClient::validate(e).isEmpty());
   odinMap->set_id("invalid");
   CHECK(!ProtocolClient::validate(e).isEmpty());
+  auto *replay = e.mutable_replay_status();
+  replay->set_state(mission::ReplayStatus::PLAYING);
+  replay->set_bag_id("mission3dg-20261010-120000");
+  replay->set_position_seconds(3);
+  replay->set_duration_seconds(10);
+  replay->set_speed(1);
+  replay->set_epoch(2);
+  CHECK(ProtocolClient::validate(e).isEmpty());
+  replay->set_position_seconds(11);
+  CHECK(!ProtocolClient::validate(e).isEmpty());
+  replay->set_position_seconds(3);
+  mission::Command replaySeek;
+  replaySeek.set_kind(mission::Command::REPLAY_SEEK);
+  replaySeek.set_replay_seconds(4.5);
+  mission::Command decodedReplaySeek;
+  CHECK(decodedReplaySeek.ParseFromString(replaySeek.SerializeAsString()));
+  CHECK(decodedReplaySeek.kind() == mission::Command::REPLAY_SEEK &&
+        decodedReplaySeek.replay_seconds() == 4.5);
   int messages = 0;
   QObject::connect(&client, &ProtocolClient::message,
                    [&](const mission::Envelope &) { ++messages; });
@@ -194,12 +242,15 @@ int main(int argc, char **argv) {
   e.mutable_hello();
   CHECK(!client.routeEditSupported());
   CHECK(!client.routeDeleteSupported());
+  CHECK(!client.bagReplaySupported());
   e.mutable_hello()->add_capabilities("route-edit-v1");
   e.mutable_hello()->add_capabilities("route-delete-v1");
+  e.mutable_hello()->add_capabilities("bag-replay-v1");
   client.ingest(ProtocolClient::encode(e));
   CHECK(messages == 1);
   CHECK(client.routeEditSupported());
   CHECK(client.routeDeleteSupported());
+  CHECK(client.bagReplaySupported());
   CHECK(!client.connected());
   mission::Command offlineYaml;
   offlineYaml.set_kind(mission::Command::GET_YAML_CATALOG);
@@ -234,7 +285,8 @@ int main(int argc, char **argv) {
   CHECK(client.receiveMbps() == 0 && client.transmitMbps() == 0);
   QWebSocketServer server("test", QWebSocketServer::NonSecureMode);
   CHECK(server.listen(QHostAddress::LocalHost, 0));
-  int commands = 0, results = 0, clouds = 0, grids = 0, files = 0;
+  int commands = 0, results = 0, clouds = 0, projections = 0,
+      grids = 0, files = 0;
   bool latestGridReceived = false;
   quint64 sequence = 0;
   QList<QWebSocket *> peers;
@@ -268,6 +320,18 @@ int main(int argc, char **argv) {
       // A duplicate sequence must not replace the newer accepted snapshot.
       grid->mutable_centers(0)->set_x(99);
       peer->sendBinaryMessage(ProtocolClient::encode(push));
+      mission::Envelope projected;
+      projected.set_protocol_version(1);
+      projected.set_session_id("server");
+      projected.set_sequence(++sequence);
+      auto *overlay = projected.mutable_projection();
+      overlay->set_frame_id("odom");
+      overlay->set_map_id("map");
+      overlay->set_capture_time_ns(123);
+      overlay->set_point_count(1);
+      overlay->set_point_data(bytes.left(16).toStdString());
+      overlay->mutable_camera_orientation()->set_w(1);
+      peer->sendBinaryMessage(ProtocolClient::encode(projected));
     }
     if (peer->requestUrl().path() == "/files") {
       mission::Envelope push;
@@ -317,6 +381,8 @@ int main(int argc, char **argv) {
                      }
                      if (r.has_cloud())
                        ++clouds;
+                     if (r.has_projection())
+                       ++projections;
                      if (r.has_grid()) {
                        ++grids;
                        latestGridReceived = r.grid().centers_size() == 1 &&
@@ -324,7 +390,7 @@ int main(int argc, char **argv) {
                      }
                      if (r.has_file())
                        ++files;
-                     if (results && clouds && latestGridReceived && files)
+                     if (results && clouds && projections && latestGridReceived && files)
                        loop.quit();
                    });
   client.open(QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
@@ -332,6 +398,7 @@ int main(int argc, char **argv) {
   loop.exec();
   CHECK(commands == 1 && results == 1);
   CHECK(clouds == 1 && files == 1);
+  CHECK(projections == 1);
   CHECK(grids == 2 && latestGridReceived);
   auto *file = e.mutable_file();
   file->set_total_size(5);
@@ -407,6 +474,18 @@ int main(int argc, char **argv) {
   timeLoop.exec();
   CHECK(probes >= 3 && syncs == 1);
   timeClient.stop();
+  // The Android monitor uses the same client but must never correct the
+  // task-machine clock merely because its operator opens the status screen.
+  clockOffsetMs = 20000;
+  const int previousProbes = probes, previousSyncs = syncs;
+  ProtocolClient monitorClient(nullptr, false);
+  QEventLoop monitorLoop;
+  monitorClient.open(QUrl(QString("ws://127.0.0.1:%1").arg(timeServer.serverPort())));
+  QTimer::singleShot(1250, &monitorLoop, &QEventLoop::quit);
+  monitorLoop.exec();
+  CHECK(monitorClient.ready());
+  CHECK(probes == previousProbes && syncs == previousSyncs);
+  monitorClient.stop();
   qDeleteAll(timePeers);
   std::cout << checks
             << " checks passed (PCD ASCII/binary/LZF, malformed data, "
