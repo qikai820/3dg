@@ -874,6 +874,34 @@ void MissionController::buildUi() {
       "QPushButton[role=toolbar]:hover{background:rgba(199,231,237,190);border-"
       "radius:6px;}"
       "QPushButton[role=toolbar]:checked{background:#d0f1e9;color:#147b68;}"
+      "QPushButton#openCloudTools{background:#e1f5f0;color:#146d61;"
+      "border:1px solid #9bd6c8;border-radius:7px;font-weight:600;"
+      "padding:4px 10px;}"
+      "QPushButton#openCloudTools:hover{background:#c8eee4;border-color:#58bda8;}"
+      "QPushButton#openCloudTools:pressed{background:#ace0d2;}"
+      "QPushButton#cloudActionButton{background:#f8fbfd;color:#315062;"
+      "border:1px solid #c9dce5;border-radius:8px;text-align:left;"
+      "padding:6px 12px;min-height:24px;}"
+      "QPushButton#cloudActionButton:hover{background:#e5f5f3;"
+      "border-color:#70c8b7;color:#176f63;}"
+      "QPushButton#cloudActionButton:pressed{background:#ceeae4;}"
+      "QPushButton#cloudPrimaryButton{background:#168778;color:white;"
+      "border:1px solid #117467;border-radius:8px;font-weight:600;"
+      "text-align:left;padding:6px 12px;min-height:24px;}"
+      "QPushButton#cloudPrimaryButton:hover{background:#0e7569;border-color:#0c655a;}"
+      "QPushButton#cloudPrimaryButton:pressed{background:#095b52;}"
+      "QPushButton#cloudActionButton:disabled,QPushButton#cloudPrimaryButton:disabled{"
+      "background:#e6edf0;color:#8397a2;border-color:#d2dfe5;}"
+      "QTabWidget#missionToolsTabs::pane{border:1px solid #c9dce5;"
+      "border-radius:8px;background:rgba(255,255,255,145);padding:7px;}"
+      "QTabWidget#missionToolsTabs QTabBar::tab{background:#e9f1f5;"
+      "color:#5b7280;border:1px solid #c9dce5;border-bottom:0;"
+      "border-top-left-radius:7px;border-top-right-radius:7px;"
+      "padding:6px 18px;margin-right:3px;}"
+      "QTabWidget#missionToolsTabs QTabBar::tab:hover{background:#dff2ed;"
+      "color:#176f63;}"
+      "QTabWidget#missionToolsTabs QTabBar::tab:selected{background:#f9fcfd;"
+      "color:#146f62;border-color:#8dcdbf;font-weight:600;}"
       "QToolButton#layerTool{font-size:20px;font-weight:500;padding:3px;"
       "min-width:34px;min-height:34px;}"
       "QToolButton#mapDetailsTool{font-size:18px;padding:3px;"
@@ -917,6 +945,29 @@ void MissionController::buildUi() {
       "QToolBar#bagReplayDock{background:transparent;border:0;padding:2px 0 3px 0;}"
       "QFrame#bagReplayToolbar{background:rgba(235,244,249,245);"
       "border:1px solid #c8d9e2;border-radius:9px;}"
+      "QPushButton#replayPauseButton,QPushButton#replayStopButton{"
+      "min-height:18px;padding:3px 10px;border-radius:7px;font-weight:600;}"
+      "QPushButton#replayPauseButton{background:#168778;color:white;"
+      "border:1px solid #117467;}"
+      "QPushButton#replayPauseButton:hover{background:#0e7569;}"
+      "QPushButton#replayPauseButton:pressed{background:#095b52;}"
+      "QPushButton#replayStopButton{background:#fff7f2;color:#a4543c;"
+      "border:1px solid #e8c5b6;}"
+      "QPushButton#replayStopButton:hover{background:#ffebe1;border-color:#d89579;}"
+      "QPushButton#replayStopButton:pressed{background:#f5d9cb;}"
+      "QPushButton#replayPauseButton:disabled,QPushButton#replayStopButton:disabled{"
+      "background:#e6edf0;color:#8397a2;border-color:#d2dfe5;}"
+      "QComboBox#replaySpeedCombo{background:#f8fbfd;color:#315062;"
+      "border:1px solid #c9dce5;border-radius:7px;padding:3px 18px 3px 8px;}"
+      "QComboBox#replaySpeedCombo:hover{background:#e5f5f3;border-color:#70c8b7;}"
+      "QComboBox#replaySpeedCombo:disabled{background:#e6edf0;color:#8397a2;"
+      "border-color:#d2dfe5;}"
+      "QPushButton#bagReplayStart{background:#e1f5f0;color:#146d61;"
+      "border:1px solid #9bd6c8;border-radius:7px;font-weight:600;}"
+      "QPushButton#bagReplayStart:hover{background:#c8eee4;border-color:#58bda8;}"
+      "QPushButton#bagReplayStart:pressed{background:#ace0d2;}"
+      "QPushButton#bagReplayStart:disabled{background:#e6edf0;color:#8397a2;"
+      "border-color:#d2dfe5;}"
       "QDialog{background:#edf5f9;color:#304756;}"
       "QProgressBar{background:#d7e6eb;border:0;border-radius:3px;min-height:"
       "6px;"
@@ -934,10 +985,8 @@ void MissionController::buildUi() {
   replayHolder->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   auto *replayLayout = new QHBoxLayout(replayHolder);
   replayLayout->setContentsMargins(0, 0, 0, 0);
-  replayLayout->addStretch();
   bagReplayToolbar_ = new BagReplayToolbar(&client_, replayHolder);
-  replayLayout->addWidget(bagReplayToolbar_);
-  replayLayout->addStretch();
+  replayLayout->addWidget(bagReplayToolbar_, 1);
   replayDock->addWidget(replayHolder);
   window_->addToolBar(Qt::BottomToolBarArea, replayDock);
   bagReplayToolbar_->setWindowWidth(window_->width());
@@ -1951,14 +2000,20 @@ void MissionController::buildUi() {
   toolsTabs_->addTab(processingOnly_, "处理");
   auto addCardTool = [this](QVBoxLayout *layout, const QString &label,
                             const char *name) {
-    button(layout, label, [this, name] {
+    auto *action = button(layout, label, [this, name] {
       runCloudCompareAction(name);
     });
+    action->setObjectName("cloudActionButton");
+    action->setCursor(Qt::PointingHandCursor);
   };
   addCardTool(processingActions, "复制对象", "actionClone");
   addCardTool(processingActions, "抽稀", "actionSubsample");
   addCardTool(processingActions, "计算法向量", "actionComputeNormals");
-  button(processingActions, "一键生成数模（泊松）", [this] { quickReconstruct(); });
+  auto *reconstruct = button(processingActions, "一键生成数模（泊松）", [this] {
+    quickReconstruct();
+  });
+  reconstruct->setObjectName("cloudPrimaryButton");
+  reconstruct->setCursor(Qt::PointingHandCursor);
   addCardTool(processingActions, "栅格化", "actionRasterize");
   comparisonOnly_ = new QWidget(toolsTabs_);
   auto *comparisonActions = new QVBoxLayout(comparisonOnly_);
@@ -1982,9 +2037,11 @@ void MissionController::buildUi() {
     if (index == 1)
       selectComparisonPair();
   });
-  button(box(processingCard_), "导出选中对象", [this] {
+  auto *exportObject = button(box(processingCard_), "导出选中对象", [this] {
     runCloudCompareAction("actionSave");
   });
+  exportObject->setObjectName("cloudActionButton");
+  exportObject->setCursor(Qt::PointingHandCursor);
   detailsLayout->addStretch(1);
   detailsScroll_->setWidget(rightContents);
   left_->show();

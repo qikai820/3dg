@@ -363,6 +363,8 @@ void OdinDataManagerDialog::addRecord(const QJsonObject &record, bool bag) {
   buttons->addWidget(get);
   if (bag) {
     auto *play = new QPushButton("回放", actions);
+    play->setObjectName("bagReplayStart");
+    play->setCursor(Qt::PointingHandCursor);
     play->setEnabled(allowed && replayState_ == mission::ReplayStatus::LIVE &&
                      client_ && client_->connected() &&
                      client_->bagReplaySupported());

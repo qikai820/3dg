@@ -103,11 +103,11 @@ private:
 BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
     : QFrame(parent), client_(client) {
   setObjectName("bagReplayToolbar");
-  setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-  setFixedHeight(46);
+  setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+  setFixedHeight(52);
   auto *layout = new QHBoxLayout(this);
-  layout->setContentsMargins(10, 3, 10, 3);
-  layout->setSpacing(8);
+  layout->setContentsMargins(12, 5, 12, 5);
+  layout->setSpacing(10);
 
   leftInfo_ = new QWidget(this);
   leftInfo_->setFixedHeight(22);
@@ -149,13 +149,16 @@ BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
   auto *buttons = new QHBoxLayout;
   buttons->setSpacing(6);
   pause_ = new QPushButton("暂停", this);
+  pause_->setObjectName("replayPauseButton");
   stop_ = new QPushButton("停止回放", this);
+  stop_->setObjectName("replayStopButton");
   for (QPushButton *button : {pause_, stop_}) {
-    button->setFixedHeight(22);
-    button->setStyleSheet("min-height:14px;padding:1px 6px;border-radius:5px;");
+    button->setFixedHeight(28);
+    button->setCursor(Qt::PointingHandCursor);
   }
   speed_ = new QComboBox(this);
-  speed_->setFixedHeight(22);
+  speed_->setObjectName("replaySpeedCombo");
+  speed_->setFixedHeight(28);
   for (double speed : {.25, .5, 1.0, 2.0, 4.0})
     speed_->addItem(QString("%1 倍").arg(speed, 0, 'g', 3), speed);
   speed_->setCurrentIndex(2);
@@ -222,9 +225,7 @@ BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
 }
 
 void BagReplayToolbar::setWindowWidth(int width) {
-  const int barWidth = qMax(0, width * 2 / 3);
-  setFixedWidth(barWidth);
-  leftInfo_->setFixedWidth(qMin(barWidth * 2 / 5, 440));
+  leftInfo_->setFixedWidth(qMin(width / 3, 440));
   updateStatusText();
 }
 
