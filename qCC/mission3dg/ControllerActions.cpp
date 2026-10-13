@@ -509,10 +509,10 @@ void MissionController::resetSession() {
   clearOdinOverlays();
   lastVehicle_.Clear();
   vehicleAge_.invalidate();
-  if (!replayDialog_ && hud_) {
-    hud_->setText("解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
-    batteryBar_->setValue(0);
-  }
+  flightSampleAge_.invalidate();
+  flightSeconds_ = flightDistanceM_ = 0;
+  if (!replayDialog_)
+    resetHud("等待遥测");
   plannerAge_.invalidate();
   lastStatus_.Clear();
   statusAge_.invalidate();
@@ -539,6 +539,7 @@ void MissionController::applyBagReplayStatus(const mission::ReplayStatus &status
     egoPoints_.clear();
     lastVehicle_.Clear();
     vehicleAge_.invalidate();
+    flightSampleAge_.invalidate();
     plannerAge_.invalidate();
     expireGrid();
     clearOdinOverlays();
@@ -546,8 +547,8 @@ void MissionController::applyBagReplayStatus(const mission::ReplayStatus &status
     if (aircraftModel_)
       aircraftModel_->setVisible(false);
     if (!replayDialog_) {
-      hud_->setText(active ? "历史 bag 回放 · 等待定位\n飞控状态 未知"
-                           : "等待实时定位\n飞控状态 未知");
+      resetHud(active ? "等待回放定位" : "等待实时定位",
+               active ? "历史 bag 回放" : QString());
     }
   }
   bagReplayEpoch_ = status.epoch();
@@ -2452,7 +2453,7 @@ void MissionController::smoke() {
       q->set_x(rotation.x());
       q->set_y(rotation.y());
       q->set_z(rotation.z());
-      updateVehicle(state);
+      updateVehicle(state, false);
       // Assert before the bulk scene pass: the new pose must be visible now.
       CCVector3 point(probes[axis].x(), probes[axis].y(), probes[axis].z());
       aircraftModel_->getGLTransformation().apply(point);
@@ -2465,9 +2466,9 @@ void MissionController::smoke() {
                                          childId(ego_) == egoId;
   auto invalidVehicle = savedVehicle;
   invalidVehicle.set_pose_valid(false);
-  updateVehicle(invalidVehicle);
+  updateVehicle(invalidVehicle, false);
   const bool aircraftInvalidHidden = aircraftModel_ && !aircraftModel_->isVisible();
-  updateVehicle(savedVehicle);
+  updateVehicle(savedVehicle, false);
   history_ = savedHistory;
   trailDirty_ = dirty_ = true;
   updateScene();
@@ -2773,7 +2774,7 @@ void MissionController::smoke() {
     waypointDefaultsToAircraft &= mission_.waypoints_size() == countBeforeAdd;
     auto invalidPose = lastVehicle_;
     invalidPose.set_pose_valid(false);
-    updateVehicle(invalidPose);
+    updateVehicle(invalidPose, false);
     QTimer::singleShot(0, this, [&] {
       if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
         bool hasManualHint = false, hasConfirmation = false;
@@ -2822,7 +2823,7 @@ void MissionController::smoke() {
       mission_.mutable_waypoints()->DeleteSubrange(countBeforeAdd, 1);
       rebuildRoute();
     }
-    updateVehicle(savedVehicle);
+    updateVehicle(savedVehicle, false);
   }
   mission::YamlDocument routeSample;
   routeSample.set_usage("GUI 自检样例");
@@ -2943,6 +2944,7 @@ void MissionController::smoke() {
   checkWorkspace("menu_height", window_->menuBar()->height() <= 36 &&
                                     latest_->height() <= window_->menuBar()->height() &&
                                     latest_->y() >= 0);
+  checkWorkspace("status_bar_hidden", !window_->statusBar()->isVisible());
   if (workspaceMenu) {
     workspaceMenu->popup(window_->menuBar()->mapToGlobal(
         QPoint(8, window_->menuBar()->height())));
@@ -3256,6 +3258,7 @@ void MissionController::smoke() {
   checkWorkspace("task_controls_fixed", endMissionButton &&
       endMissionButton->isVisible() &&
       endMissionButton->mapTo(right_, QPoint()).y() < right_->height());
+  processingCard_->grab().save(p + "/processing-card.png");
   window_->grab().save(p + "/processing.png");
   toolsTabs_->setCurrentWidget(comparisonOnly_);
   QApplication::processEvents();

@@ -7,6 +7,20 @@ The Android target reuses the desktop `mission.proto`, `ProtocolClient`, and
 
 ## Build ARM64
 
+On a new machine, provision the matching Qt, Android SDK/NDK, and host
+`protoc` first:
+
+```bash
+./scripts/setup-3dg-android-env.sh
+```
+
+This installs the toolchain in the sibling `android-dev/` directory. The
+installer needs network access and accepts the Android SDK/NDK and Qt open
+source licenses. Java 21, CMake, Ninja, and a C++ toolchain must be available
+on the host.
+
+Then build the APK:
+
 ```bash
 ./scripts/build-3dg-android.sh
 ```

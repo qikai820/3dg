@@ -3,6 +3,7 @@
 #include "ProtocolClient.h"
 #include <QCryptographicHash>
 #include <QColor>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
 #include <QJsonArray>
@@ -80,6 +81,9 @@ private:
   void restoreCloudNoiseView();
   void refreshMapInfo();
   void refreshLinkStats();
+  void resetHud(const QString &message, const QString &context = {});
+  void updateFlightTotals(const mission::VehicleState &state);
+  void showFlightTotals();
   void refreshStartupButtons();
   void refreshTaskModeControls();
   void switchTaskMode(mission::TaskMode mode);
@@ -146,7 +150,7 @@ private:
   void renderFlightReplay(const FlightReplayFrame &frame);
   void clearFlightReplay();
   void expireGrid();
-  void updateVehicle(const mission::VehicleState &);
+  void updateVehicle(const mission::VehicleState &, bool countFlight = true);
   void setStatusCells(const QStringList &values);
   void updateAircraftPose();
   void updateOdinSensorPose(const mission::OdinSensorPose &);
@@ -251,15 +255,14 @@ private:
   QString modeSwitchRequest_;
   QAction *taskModeStatus_ = nullptr, *realModeAction_ = nullptr,
           *simModeAction_ = nullptr;
-  QLabel *hud_ = nullptr, *mode_ = nullptr,
+  QLabel *mode_ = nullptr,
          *logCount_ = nullptr, *mapInfo_ = nullptr,
          *mapBadge_ = nullptr, *protocolHint_ = nullptr,
          *bitError_ = nullptr, *protocolError_ = nullptr,
          *networkDown_ = nullptr, *networkUp_ = nullptr,
-         *routeSummary_ = nullptr, *routeStats_ = nullptr,
+         *routeStats_ = nullptr,
          *remoteRouteInfo_ = nullptr;
   QVector<QLabel *> statusCells_;
-  QProgressBar *batteryBar_ = nullptr;
   QPushButton *latest_ = nullptr;
   QPushButton *connectButton_ = nullptr;
   QAction *demoAction_ = nullptr, *settingsMenuAction_ = nullptr;
@@ -269,7 +272,6 @@ private:
   QToolButton *mapDetailsButton_ = nullptr;
   QToolButton *gridButton_ = nullptr;
   QToolButton *ordinaryMapButton_ = nullptr, *colorMapButton_ = nullptr;
-  QPushButton *routeFold_ = nullptr;
   QPushButton *remoteEditButton_ = nullptr, *remoteSaveButton_ = nullptr,
               *remoteDeleteButton_ = nullptr, *remoteRefreshButton_ = nullptr;
   QListWidget *logList_ = nullptr;
@@ -318,6 +320,10 @@ private:
   mission::MissionPlan mission_;
   mission::CompanionStatus lastStatus_;
   mission::VehicleState lastVehicle_;
+  QElapsedTimer flightSampleAge_;
+  QVector3D flightSamplePosition_;
+  QString flightSampleFrame_, flightSampleMap_;
+  double flightSeconds_ = 0, flightDistanceM_ = 0;
   QString baseUrl_ = "ws://192.168.144.50:8765", videoUrl_, frame_ = "odom",
           mapId_ = "local-map";
   QString connectionState_ = "未连接";
@@ -330,7 +336,6 @@ private:
   int colorDrawStep_ = 0;
   bool liveDirty_ = false, colorMapDirty_ = false,
        trailDirty_ = false, egoDirty_ = false;
-  bool editorCollapsed_ = true;
   bool toolbarCollapsed_ = false;
   int demoStep_ = 0, unread_ = 0, drawStep_ = 0;
   quint64 demoSequence_ = 0;

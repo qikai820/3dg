@@ -583,12 +583,46 @@ void FlightReplayDialog::seek(int milliseconds) {
   const double now = startNs_ + double(milliseconds) * 1e6;
   FlightReplayFrame frame;
   QJsonObject latestTelemetry;
+  bool previousFlying = false;
+  double previousTimeNs = 0;
+  QVector3D previousPosition;
+  QString previousFrame, previousMap;
   for (const auto &entry : telemetry_) {
     const auto row = entry.toObject();
     if (timeNs(row) > now)
       break;
     QVector3D point;
-    if (coordinate(row, point)) {
+    const bool positionValid = coordinate(row, point);
+    const auto connected = row.value("connected");
+    const auto armed = row.value("armed");
+    const bool fcuConnected = connected.isBool() ? connected.toBool()
+                                                  : connected.toInt(-1) == 1;
+    const bool fcuValid = fcuConnected &&
+        (armed.isBool() || armed.toInt(-1) == 0 || armed.toInt(-1) == 1);
+    frame.flightStatsValid |= fcuValid;
+    const bool flying = fcuValid &&
+        (armed.isBool() ? armed.toBool() : armed.toInt() == 1) && positionValid;
+    const double sampleNs = timeNs(row);
+    if (flying && previousFlying) {
+      const double dt = (sampleNs - previousTimeNs) / 1e9;
+      if (dt > 0 && dt <= 1.0) {
+        frame.flightSeconds += dt;
+        if (previousFrame == row.value("frame_id").toString() &&
+            previousMap == row.value("map_id").toString()) {
+          const double step = double((point - previousPosition).length());
+          if (step <= 40.0 * dt + 0.5)
+            frame.flightDistanceM += step;
+        }
+      }
+    }
+    previousFlying = flying;
+    previousTimeNs = sampleNs;
+    if (flying) {
+      previousPosition = point;
+      previousFrame = row.value("frame_id").toString();
+      previousMap = row.value("map_id").toString();
+    }
+    if (positionValid) {
       frame.position = point;
       frame.poseValid = true;
       frame.trail.append(point);

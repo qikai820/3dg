@@ -135,33 +135,103 @@ class AttitudeWidget : public QWidget {
 public:
   double roll = 0, pitch = 0;
   bool valid = false;
-  explicit AttitudeWidget(QWidget *p) : QWidget(p) { setFixedSize(76, 76); }
+  QString armed = "未知", flightMode = "未知", angles = "— / — / —",
+          speed = "—", position = "— / — / —", battery = "—",
+          flightTime = "00:00:00", flightDistance = "0.0 m", notice, context;
+  explicit AttitudeWidget(QWidget *p) : QWidget(p) {
+    setMinimumHeight(230);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    setToolTip("数值顺序：横滚 / 俯仰 / 航向；位置 X / Y / Z。"
+               "飞行统计按当前实时会话中已解锁且定位有效的遥测累计。");
+  }
+  QSize sizeHint() const override { return {270, 244}; }
+  void reset(const QString &message = {}) {
+    roll = pitch = 0;
+    valid = false;
+    armed = flightMode = "未知";
+    angles = position = "— / — / —";
+    speed = battery = "—";
+    notice = message;
+    context.clear();
+    update();
+  }
   void paintEvent(QPaintEvent *) override {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
-    p.translate(38, 38);
+    const QRectF area = rect();
     QPainterPath clip;
-    clip.addEllipse(QPointF(0, 0), 34, 34);
+    clip.addRoundedRect(area, 12, 12);
     p.setClipPath(clip);
-    p.save();
-    p.rotate(-roll);
-    p.translate(0, pitch * 0.65);
-    p.fillRect(-100, -140, 200, 140, QColor(53, 102, 132));
-    p.fillRect(-100, 0, 200, 140, QColor(112, 83, 60));
-    p.setPen(QPen(Qt::white, 1));
-    p.drawLine(-80, 0, 80, 0);
-    for (int y : {-20, -10, 10, 20})
-      p.drawLine(-12, y, 12, y);
-    p.restore();
-    p.setPen(QPen(QColor(255, 213, 100), 3));
-    p.drawLine(-22, 0, -6, 0);
-    p.drawLine(6, 0, 22, 0);
-    p.drawLine(-6, 0, 0, 5);
-    p.drawLine(0, 5, 6, 0);
+    p.fillRect(area, QColor(242, 248, 251, 216));
+    if (valid) {
+      p.save();
+      p.translate(area.center());
+      p.rotate(-roll);
+      p.translate(0, pitch * 1.4);
+      const qreal span = qMax(width(), height()) * 2.0;
+      p.fillRect(QRectF(-span, -span, span * 2, span), QColor(90, 166, 202, 55));
+      p.fillRect(QRectF(-span, 0, span * 2, span), QColor(119, 160, 150, 42));
+      p.setPen(QPen(QColor(83, 128, 146, 160), 1.2));
+      p.drawLine(QPointF(-span, 0), QPointF(span, 0));
+      for (int y : {-40, -20, 20, 40})
+        p.drawLine(QPointF(-18, y), QPointF(18, y));
+      p.restore();
+
+      // Fade the instrument beneath the values without separate dark panels.
+      QLinearGradient fade(0, 0, 0, height());
+      fade.setColorAt(0, QColor(242, 248, 251, 160));
+      fade.setColorAt(0.3, QColor(242, 248, 251, 0));
+      fade.setColorAt(0.58, QColor(242, 248, 251, 0));
+      fade.setColorAt(0.76, QColor(242, 248, 251, 185));
+      fade.setColorAt(1, QColor(242, 248, 251, 185));
+      p.fillRect(area, fade);
+      p.setPen(QPen(QColor(20, 125, 110), 2.5,
+                    Qt::SolidLine, Qt::RoundCap));
+      const qreal cx = width() / 2.0, cy = height() / 2.0;
+      p.drawLine(QPointF(cx - 31, cy), QPointF(cx - 7, cy));
+      p.drawLine(QPointF(cx + 7, cy), QPointF(cx + 31, cy));
+      p.drawLine(QPointF(cx - 7, cy), QPointF(cx, cy + 6));
+      p.drawLine(QPointF(cx, cy + 6), QPointF(cx + 7, cy));
+    }
+
+    p.setPen(QColor(48, 71, 86));
+    QFont font = p.font();
+    font.setPixelSize(13);
+    font.setWeight(QFont::DemiBold);
+    p.setFont(font);
+    p.drawText(QRect(12, 5, width() - 112, 28),
+               Qt::AlignVCenter | Qt::AlignLeft, armed + "  " + flightTime);
+    p.drawText(QRect(width() - 100, 5, 88, 28),
+               Qt::AlignVCenter | Qt::AlignRight, flightMode);
+    font.setPixelSize(12);
+    font.setWeight(QFont::Normal);
+    p.setFont(font);
+    p.drawText(QRect(width() - 100, 31, 88, 21),
+               Qt::AlignVCenter | Qt::AlignRight, flightDistance);
+    if (!context.isEmpty()) {
+      font.setPixelSize(11);
+      p.setFont(font);
+      p.drawText(QRect(12, 31, width() - 112, 21),
+                 Qt::AlignVCenter | Qt::AlignLeft, context);
+    }
+    font.setPixelSize(14);
+    p.setFont(font);
+    const int bottom = height() - 82;
+    p.drawText(QRect(8, bottom + 2, width() - 16, 25), Qt::AlignCenter,
+               angles);
+    p.drawText(QRect(12, bottom + 28, width() / 2 - 12, 23),
+               Qt::AlignVCenter | Qt::AlignLeft, speed);
+    p.drawText(QRect(width() / 2, bottom + 28, width() / 2 - 12, 23),
+               Qt::AlignVCenter | Qt::AlignRight, battery);
+    font.setPixelSize(12);
+    p.setFont(font);
+    p.drawText(QRect(8, bottom + 53, width() - 16, 24), Qt::AlignCenter,
+               position);
     if (!valid) {
-      p.fillRect(-38, -38, 76, 76, QColor(10, 20, 30, 180));
-      p.setPen(Qt::white);
-      p.drawText(QRect(-35, -15, 70, 30), Qt::AlignCenter, "无姿态");
+      p.setPen(QColor(101, 125, 141));
+      p.drawText(QRect(8, 53, width() - 16, bottom - 51),
+                 Qt::AlignCenter | Qt::TextWordWrap,
+                 notice.isEmpty() ? QStringLiteral("无姿态") : notice);
     }
   }
 };
@@ -401,6 +471,18 @@ void setvec(mission::Vec3 *p, const QVector3D &v) {
 QString safe(const std::string &s) {
   return QString::fromStdString(s).toHtmlEscaped();
 }
+QString flightTimeText(double totalSeconds) {
+  const qint64 seconds = qint64(totalSeconds);
+  return QString("%1:%2:%3")
+      .arg(seconds / 3600, 2, 10, QChar('0'))
+      .arg((seconds / 60) % 60, 2, 10, QChar('0'))
+      .arg(seconds % 60, 2, 10, QChar('0'));
+}
+QString flightDistanceText(double distanceM) {
+  return distanceM >= 1000
+      ? QString::number(distanceM / 1000, 'f', 2) + " km"
+      : QString::number(distanceM, 'f', 1) + " m";
+}
 } // namespace
 void MissionController::setStatusCells(const QStringList &values) {
   for (int i = 0; i < statusCells_.size(); ++i)
@@ -439,7 +521,53 @@ void MissionController::refreshLinkStats() {
   mapPopover_->resize(mapPopover_->width(),
                       height > 0 ? height : mapPopover_->sizeHint().height());
 }
-void MissionController::updateVehicle(const mission::VehicleState &s) {
+void MissionController::resetHud(const QString &message,
+                                 const QString &context) {
+  if (!attitude_)
+    return;
+  attitude_->reset(message);
+  attitude_->context = context;
+  if (context.startsWith("历史"))
+    attitude_->flightTime = attitude_->flightDistance = "—";
+  else
+    showFlightTotals();
+  attitude_->update();
+}
+void MissionController::showFlightTotals() {
+  if (!attitude_)
+    return;
+  attitude_->flightTime = flightTimeText(flightSeconds_);
+  attitude_->flightDistance = flightDistanceText(flightDistanceM_);
+}
+void MissionController::updateFlightTotals(const mission::VehicleState &state) {
+  if (bagReplayActive_ || !state.fcu_state_valid() || !state.armed() ||
+      !state.pose_valid()) {
+    flightSampleAge_.invalidate();
+    return;
+  }
+  const QVector3D position = vec(state.position());
+  if (flightSampleAge_.isValid()) {
+    const qint64 elapsedMs = flightSampleAge_.elapsed();
+    if (elapsedMs > 0 && elapsedMs <= 1000) {
+      const double dt = elapsedMs / 1000.0;
+      flightSeconds_ += dt;
+      if (flightSampleFrame_ == QString::fromStdString(state.frame_id()) &&
+          flightSampleMap_ == QString::fromStdString(state.map_id())) {
+        const double step = double((position - flightSamplePosition_).length());
+        if (step <= 40.0 * dt + 0.5)
+          flightDistanceM_ += step;
+      }
+    }
+  }
+  flightSamplePosition_ = position;
+  flightSampleFrame_ = QString::fromStdString(state.frame_id());
+  flightSampleMap_ = QString::fromStdString(state.map_id());
+  flightSampleAge_.start();
+}
+void MissionController::updateVehicle(const mission::VehicleState &s,
+                                      bool countFlight) {
+  if (countFlight)
+    updateFlightTotals(s);
   lastVehicle_ = s;
   vehicleAge_.restart();
   if (s.pose_valid()) {
@@ -454,7 +582,7 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
   if (replayDialog_)
     return;
   attitude_->valid = s.pose_valid();
-  QString position = "—", angles = "—", speed = "—";
+  QString position = "— / — / —", angles = "— / — / —", speed = "—";
   if (s.pose_valid()) {
     auto p = vec(s.position());
     auto &q = s.orientation();
@@ -466,7 +594,7 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
                             1 - 2 * (q.y() * q.y() + q.z() * q.z()));
     attitude_->roll = roll * 180 / M_PI;
     attitude_->pitch = pitch * 180 / M_PI;
-    angles = QString("R%1° P%2° Y%3°")
+    angles = QString("%1°  /  %2°  /  %3°")
                  .arg(roll * 180 / M_PI, 0, 'f', 0)
                  .arg(pitch * 180 / M_PI, 0, 'f', 0)
                  .arg(yaw * 180 / M_PI, 0, 'f', 0);
@@ -482,16 +610,21 @@ void MissionController::updateVehicle(const mission::VehicleState &s) {
   const QString flightMode = s.fcu_state_valid() && !s.flight_mode().empty() &&
                                      s.flight_mode() != "UNKNOWN"
                                  ? QString::fromStdString(s.flight_mode()) : "未知";
-  hud_->setText(
-      QString(bagReplayActive_
-                  ? "历史 bag 回放\n解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6"
-                  : "解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6")
-          .arg(armed, flightMode, angles, speed, position,
-               s.battery_valid()
-                   ? QString::number(s.battery_percent(), 'f', 0) + "%"
-                   : "—"));
-  batteryBar_->setValue(
-      s.battery_valid() ? qBound(0, int(s.battery_percent()), 100) : 0);
+  attitude_->armed = armed;
+  attitude_->flightMode = flightMode;
+  attitude_->angles = angles;
+  attitude_->speed = speed;
+  attitude_->position = position;
+  attitude_->battery = s.battery_valid()
+                           ? QString::number(s.battery_percent(), 'f', 0) + "%"
+                           : "—";
+  attitude_->notice.clear();
+  attitude_->context = bagReplayActive_ ? "历史 bag 回放" : QString();
+  if (bagReplayActive_) {
+    attitude_->flightTime = attitude_->flightDistance = "—";
+  } else {
+    showFlightTotals();
+  }
   attitude_->update();
   // Pose is latency-sensitive and cheap: do not wait for the 10 Hz cloud pass.
   updateAircraftPose();
@@ -675,11 +808,9 @@ MissionController::MissionController(MainWindow *w)
               clearOdinOverlays();
               dirty_ = true;
               vehicleAge_.invalidate();
+              flightSampleAge_.invalidate();
               if (!replayDialog_) {
-                hud_->setText("解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
-                batteryBar_->setValue(0);
-                attitude_->valid = false;
-                attitude_->update();
+                resetHud("等待遥测");
               }
               setStatusCells({"任务机 离线", "Odin1 —", "EGO —", "定位 —",
                               "点云 —", "网络 —", "CPU —", "磁盘 —",
@@ -723,10 +854,9 @@ MissionController::MissionController(MainWindow *w)
     if (!demo_ && bagReplayState_ != mission::ReplayStatus::PAUSED &&
         bagReplayState_ != mission::ReplayStatus::ENDED &&
         vehicleAge_.isValid() && vehicleAge_.elapsed() > 3000) {
+      flightSampleAge_.invalidate();
       if (!replayDialog_) {
-        hud_->setText("遥测已过期（超过 3 秒）\n解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
-        attitude_->valid = false;
-        attitude_->update();
+        resetHud("遥测已过期（超过 3 秒）");
       }
       if (aircraftModel_)
         aircraftModel_->setVisible(false);
@@ -846,10 +976,10 @@ void MissionController::buildUi() {
       "border:1px solid rgba(255,255,255,220);border-radius:12px;}"
       "QFrame#missionToolbar{background:rgba(235,244,249,220);border-radius:"
       "10px;}"
+      "QFrame#hudCard{background:transparent;border:0;border-radius:0;}"
       "QFrame#videoOverlay{background:#081116;border:0;border-radius:0;}"
       "QLabel{color:#304756;background:transparent;}"
       "QLabel#cardTitle{font-size:13px;font-weight:650;color:#263d4c;}"
-      "QLabel#hudText{font-size:14px;font-weight:600;color:#223c4c;}"
       "QLabel#statusCell{font-size:12px;color:#304756;}"
       "QLabel#sectionTitle{font-size:11px;font-weight:650;color:#657d8d;}"
       "QLabel#mutedText{color:#657d8d;font-size:11px;}"
@@ -869,6 +999,7 @@ void MissionController::buildUi() {
       "QPushButton:checked,QToolButton:checked{background:#c9f2e9;border-color:"
       "#52bfa9;"
       "color:#147a68;}"
+      "QPushButton[compactButton=true]{padding:3px 7px;min-height:20px;}"
       "QPushButton[role=toolbar]{background:transparent;border:0;padding:5px "
       "7px;}"
       "QPushButton[role=toolbar]:hover{background:rgba(199,231,237,190);border-"
@@ -881,23 +1012,23 @@ void MissionController::buildUi() {
       "QPushButton#openCloudTools:pressed{background:#ace0d2;}"
       "QPushButton#cloudActionButton{background:#f8fbfd;color:#315062;"
       "border:1px solid #c9dce5;border-radius:8px;text-align:left;"
-      "padding:6px 12px;min-height:24px;}"
+      "padding:3px 8px;min-height:20px;font-size:13px;}"
       "QPushButton#cloudActionButton:hover{background:#e5f5f3;"
       "border-color:#70c8b7;color:#176f63;}"
       "QPushButton#cloudActionButton:pressed{background:#ceeae4;}"
       "QPushButton#cloudPrimaryButton{background:#168778;color:white;"
       "border:1px solid #117467;border-radius:8px;font-weight:600;"
-      "text-align:left;padding:6px 12px;min-height:24px;}"
+      "text-align:left;padding:3px 8px;min-height:20px;font-size:13px;}"
       "QPushButton#cloudPrimaryButton:hover{background:#0e7569;border-color:#0c655a;}"
       "QPushButton#cloudPrimaryButton:pressed{background:#095b52;}"
       "QPushButton#cloudActionButton:disabled,QPushButton#cloudPrimaryButton:disabled{"
       "background:#e6edf0;color:#8397a2;border-color:#d2dfe5;}"
       "QTabWidget#missionToolsTabs::pane{border:1px solid #c9dce5;"
-      "border-radius:8px;background:rgba(255,255,255,145);padding:7px;}"
+      "border-radius:8px;background:rgba(255,255,255,145);padding:4px;}"
       "QTabWidget#missionToolsTabs QTabBar::tab{background:#e9f1f5;"
       "color:#5b7280;border:1px solid #c9dce5;border-bottom:0;"
       "border-top-left-radius:7px;border-top-right-radius:7px;"
-      "padding:6px 18px;margin-right:3px;}"
+      "padding:4px 12px;margin-right:3px;}"
       "QTabWidget#missionToolsTabs QTabBar::tab:hover{background:#dff2ed;"
       "color:#176f63;}"
       "QTabWidget#missionToolsTabs QTabBar::tab:selected{background:#f9fcfd;"
@@ -916,7 +1047,7 @@ void MissionController::buildUi() {
       "border-radius:7px;color:#2b4654;font-size:11px;padding:"
       "1px 10px;}"
       "QCheckBox{color:#2d4655;spacing:7px;padding:5px 3px;}"
-      "QCheckBox#sensorToggle{padding:3px 3px;}"
+      "QCheckBox#sensorToggle{padding:1px 2px;spacing:5px;}"
       "QCheckBox::indicator{width:11px;height:11px;border:1px solid #90a8b7;"
       "border-radius:6px;background:#f5fafc;}"
       "QCheckBox::indicator:checked{background:#58cdb5;border-color:#58cdb5;}"
@@ -943,25 +1074,28 @@ void MissionController::buildUi() {
       "border-top:1px solid #d6e5ec;min-height:23px;}"
       "QStatusBar::item{border:0;}"
       "QToolBar#bagReplayDock{background:transparent;border:0;padding:2px 0 3px 0;}"
-      "QFrame#bagReplayToolbar{background:rgba(235,244,249,245);"
-      "border:1px solid #c8d9e2;border-radius:9px;}"
-      "QPushButton#replayPauseButton,QPushButton#replayStopButton{"
-      "min-height:18px;padding:3px 10px;border-radius:7px;font-weight:600;}"
-      "QPushButton#replayPauseButton{background:#168778;color:white;"
-      "border:1px solid #117467;}"
-      "QPushButton#replayPauseButton:hover{background:#0e7569;}"
-      "QPushButton#replayPauseButton:pressed{background:#095b52;}"
-      "QPushButton#replayStopButton{background:#fff7f2;color:#a4543c;"
-      "border:1px solid #e8c5b6;}"
-      "QPushButton#replayStopButton:hover{background:#ffebe1;border-color:#d89579;}"
-      "QPushButton#replayStopButton:pressed{background:#f5d9cb;}"
-      "QPushButton#replayPauseButton:disabled,QPushButton#replayStopButton:disabled{"
-      "background:#e6edf0;color:#8397a2;border-color:#d2dfe5;}"
-      "QComboBox#replaySpeedCombo{background:#f8fbfd;color:#315062;"
-      "border:1px solid #c9dce5;border-radius:7px;padding:3px 18px 3px 8px;}"
-      "QComboBox#replaySpeedCombo:hover{background:#e5f5f3;border-color:#70c8b7;}"
-      "QComboBox#replaySpeedCombo:disabled{background:#e6edf0;color:#8397a2;"
-      "border-color:#d2dfe5;}"
+      "QFrame#bagReplayToolbar{"
+      "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+      "stop:0 rgba(250,253,254,249),stop:1 rgba(229,241,246,246));"
+      "border:1px solid #c7dce4;border-radius:9px;}"
+      "QLabel#replayTimeLabel{background:transparent;"
+      "color:#315866;border:0;}"
+      "QToolButton#replayPlaybackButton{background:transparent;"
+      "color:#176f63;border:0;border-radius:6px;padding:0;}"
+      "QToolButton#replayPlaybackButton:hover{background:#d7efeb;}"
+      "QToolButton#replayPlaybackButton:pressed{background:#c8eee4;}"
+      "QToolButton#replayPlaybackButton::menu-button{width:16px;"
+      "border:0;background:transparent;}"
+      "QToolButton#replayPlaybackButton:disabled{background:transparent;"
+      "color:#75a19a;border:0;}"
+      "QToolButton#replayPlaybackButton:disabled::menu-button{"
+      "background:transparent;border:0;}"
+      "QToolButton#replaySpeedButton{background:transparent;"
+      "color:#315062;border:0;border-radius:6px;padding:0;"
+      "font-weight:700;}"
+      "QToolButton#replaySpeedButton:hover{background:#e5f5f3;}"
+      "QToolButton#replaySpeedButton:disabled{background:transparent;"
+      "color:#8397a2;border:0;}"
       "QPushButton#bagReplayStart{background:#e1f5f0;color:#146d61;"
       "border:1px solid #9bd6c8;border-radius:7px;font-weight:600;}"
       "QPushButton#bagReplayStart:hover{background:#c8eee4;border-color:#58bda8;}"
@@ -989,7 +1123,6 @@ void MissionController::buildUi() {
   replayLayout->addWidget(bagReplayToolbar_, 1);
   replayDock->addWidget(replayHolder);
   window_->addToolBar(Qt::BottomToolBarArea, replayDock);
-  bagReplayToolbar_->setWindowWidth(window_->width());
   window_->installEventFilter(this);
   auto *bar = window_->menuBar();
   bar->setFixedHeight(34);
@@ -1103,10 +1236,7 @@ void MissionController::buildUi() {
     if (gl_)
       gl_->redraw();
     mode_->setText("◷ 飞行记录回放 · 历史数据 · " + connectionState_);
-    hud_->setText("历史回放 · 等待记录\n解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
-    batteryBar_->setValue(0);
-    attitude_->valid = false;
-    attitude_->update();
+    resetHud("等待记录", "历史回放");
     if (demoAction_)
       demoAction_->setEnabled(false);
     auto *dialog = new FlightReplayDialog(QUrl(baseUrl_),
@@ -1118,12 +1248,9 @@ void MissionController::buildUi() {
       clearFlightReplay();
       replayDialog_.clear();
       if (vehicleAge_.isValid() && vehicleAge_.elapsed() <= 3000)
-        updateVehicle(lastVehicle_);
+        updateVehicle(lastVehicle_, false);
       else {
-        hud_->setText("解锁状态 未知\n飞行模式 未知\n姿态 / 速度 / 位置 / 电量：—");
-        batteryBar_->setValue(0);
-        attitude_->valid = false;
-        attitude_->update();
+        resetHud("等待遥测");
       }
       mode_->setText(demo_ ? "● 模拟演示 · 非真实遥测"
                            : (ready_ ? "● " + connectionState_
@@ -1532,29 +1659,16 @@ void MissionController::buildUi() {
   });
   editor_ = card(canvas_, "");
   auto *edit = box(editor_);
-  auto *routeHeading = new QHBoxLayout;
-  edit->addLayout(routeHeading);
-  auto *routeTitle = new QLabel("航点任务", editor_);
-  routeTitle->setObjectName("cardTitle");
-  routeHeading->addWidget(routeTitle);
-  routeSummary_ = new QLabel("0 个航点 · 编辑中", editor_);
-  routeSummary_->setObjectName("mutedText");
-  routeHeading->addWidget(routeSummary_);
-  routeHeading->addStretch();
-  auto *remoteRouteButton = button(routeHeading, "从任务机载入", [this] {
-    loadOnboardRoute();
-    setEditorCollapsed(false);
-  });
-  remoteRouteButton->setToolTip("读取任务机当前 EGO 航线到同一编辑列表；未上传修改会先提示确认");
-  routeFold_ = button(routeHeading, "查看 ↗", [this] {
-    setEditorCollapsed(!editorCollapsed_);
-  });
-  routeFold_->setAccessibleName("查看航点任务弹窗");
+  edit->setContentsMargins(8, 4, 8, 4);
   routeStrip_ = new QWidget(editor_);
+  routeStrip_->installEventFilter(this);
+  routeStrip_->setFocusPolicy(Qt::StrongFocus);
+  routeStrip_->setAccessibleName("航点任务，双击或按回车打开");
+  routeStrip_->setToolTip("双击打开航点任务");
   auto *strip = new QHBoxLayout(routeStrip_);
   strip->setContentsMargins(0, 0, 0, 0);
   strip->setSpacing(3);
-  routeStrip_->setFixedHeight(31);
+  routeStrip_->setFixedHeight(28);
   edit->addWidget(routeStrip_);
   routeDialog_ = new QDialog(window_);
   routeDialog_->setWindowTitle("航点任务 · 编辑与同步");
@@ -1689,26 +1803,17 @@ void MissionController::buildUi() {
   auto *r = new QVBoxLayout(right_);
   r->setContentsMargins(0, 0, 0, 0);
   r->setSpacing(10);
-  auto *h = card(right_, "无人机 HUD");
+  auto *h = card(right_, "");
+  h->setObjectName("hudCard");
+  box(h)->setContentsMargins(0, 0, 0, 0);
+  box(h)->setSpacing(0);
   r->addWidget(h);
-  auto *hr = new QHBoxLayout;
   attitude_ = new AttitudeWidget(h);
-  hr->addWidget(attitude_);
-  hud_ = new QLabel("解锁状态 未知\n飞行模式 未知\nR— P— Y—\n速度 —\nXYZ —\n电量 —");
-  hud_->setObjectName("hudText");
-  hud_->setTextFormat(Qt::PlainText);
-  hud_->setWordWrap(true);
-  hr->addWidget(hud_, 1);
-  box(h)->addLayout(hr);
-  batteryBar_ = new QProgressBar(h);
-  batteryBar_->setRange(0, 100);
-  batteryBar_->setValue(0);
-  batteryBar_->setTextVisible(false);
-  box(h)->addWidget(batteryBar_);
+  attitude_->reset("等待遥测");
+  box(h)->addWidget(attitude_);
   auto *sensorCard = card(right_, "Odin1 视场与图像");
-  box(sensorCard)->setContentsMargins(10, 7, 10, 7);
-  box(sensorCard)->setSpacing(2);
-  r->addWidget(sensorCard);
+  box(sensorCard)->setContentsMargins(9, 7, 9, 7);
+  box(sensorCard)->setSpacing(1);
   auto addSensorToggle = [this, sensorCard](const QString &label,
                                              const QString &hint,
                                              const QString &key,
@@ -1750,10 +1855,11 @@ void MissionController::buildUi() {
   sensorOverlayStatus_->setObjectName("mutedText");
   sensorOverlayStatus_->setTextFormat(Qt::PlainText);
   sensorOverlayStatus_->setWordWrap(false);
-  sensorOverlayStatus_->setFixedHeight(36);
+  sensorOverlayStatus_->setFixedHeight(28);
   box(sensorCard)->addWidget(sensorOverlayStatus_);
   refreshOdinOverlayStatus();
   auto *sensorVideo = new QPushButton("开启视频", sensorCard);
+  sensorVideo->setProperty("compactButton", true);
   commands_[mission::Command::VIDEO_START] = sensorVideo;
   sensorVideo->setToolTip("启动或停止任务机视频；图像投影需 Odin1 提供带时间戳的去畸变图像");
   box(sensorCard)->addWidget(sensorVideo);
@@ -1769,12 +1875,15 @@ void MissionController::buildUi() {
   auto *detailsLayout = new QVBoxLayout(rightContents);
   detailsLayout->setContentsMargins(0, 0, 0, 0);
   detailsLayout->setSpacing(10);
+  detailsLayout->addWidget(sensorCard);
   auto *s = card(rightContents, "任务机状态信息");
+  box(s)->setContentsMargins(9, 7, 9, 7);
+  box(s)->setSpacing(5);
   detailsLayout->addWidget(s);
   auto *statusGrid = new QGridLayout;
   statusGrid->setContentsMargins(0, 0, 0, 0);
-  statusGrid->setHorizontalSpacing(8);
-  statusGrid->setVerticalSpacing(5);
+  statusGrid->setHorizontalSpacing(6);
+  statusGrid->setVerticalSpacing(2);
   for (int i = 0; i < 10; ++i) {
     auto *cell = new QLabel(s);
     cell->setObjectName("statusCell");
@@ -1792,8 +1901,12 @@ void MissionController::buildUi() {
                   "点云 —", "网络 —", "CPU —", "磁盘 —",
                   "视频 —", "bag 记录 —"});
   auto *o = card(right_, "任务机操作");
+  box(o)->setContentsMargins(9, 7, 9, 7);
+  box(o)->setSpacing(5);
   r->addWidget(o);
   auto *grid = new QGridLayout;
+  grid->setHorizontalSpacing(5);
+  grid->setVerticalSpacing(4);
   box(o)->addLayout(grid);
   QVector<QPair<QString, mission::Command::Kind>> ops = {
       {"启动 Odin1", mission::Command::START_ODIN},
@@ -1803,6 +1916,7 @@ void MissionController::buildUi() {
   int i = 0;
   for (auto op : ops) {
     auto *b = new QPushButton(op.first);
+    b->setProperty("compactButton", true);
     if (op.second == mission::Command::END_MISSION)
       b->setObjectName("dangerButton");
     commands_[op.second] = b;
@@ -1985,7 +2099,8 @@ void MissionController::buildUi() {
   objectsResizeGrip_->installEventFilter(this);
   processingCard_ = card(rightContents, "点云工具");
   detailsLayout->addWidget(processingCard_);
-  box(processingCard_)->setContentsMargins(9, 7, 9, 9);
+  box(processingCard_)->setContentsMargins(8, 7, 8, 8);
+  box(processingCard_)->setSpacing(5);
   processingHint_ = new QLabel("选择对象；未选中时处理工具使用当前点云的固定副本。", processingCard_);
   processingHint_->setObjectName("mutedText");
   processingHint_->setWordWrap(true);
@@ -1996,7 +2111,7 @@ void MissionController::buildUi() {
   processingOnly_ = new QWidget(toolsTabs_);
   auto *processingActions = new QVBoxLayout(processingOnly_);
   processingActions->setContentsMargins(0, 0, 0, 0);
-  processingActions->setSpacing(4);
+  processingActions->setSpacing(3);
   toolsTabs_->addTab(processingOnly_, "处理");
   auto addCardTool = [this](QVBoxLayout *layout, const QString &label,
                             const char *name) {
@@ -2018,7 +2133,7 @@ void MissionController::buildUi() {
   comparisonOnly_ = new QWidget(toolsTabs_);
   auto *comparisonActions = new QVBoxLayout(comparisonOnly_);
   comparisonActions->setContentsMargins(0, 0, 0, 0);
-  comparisonActions->setSpacing(4);
+  comparisonActions->setSpacing(3);
   auto *comparisonInputs = new QFormLayout;
   referenceObject_ = new QComboBox(comparisonOnly_);
   targetObject_ = new QComboBox(comparisonOnly_);
@@ -2055,6 +2170,7 @@ void MissionController::buildUi() {
   protocolHint_ = new QLabel("Protobuf v1  ·  未连接", window_->statusBar());
   protocolHint_->setObjectName("mutedText");
   window_->statusBar()->addPermanentWidget(protocolHint_);
+  window_->statusBar()->hide();
   for (auto *cardWidget : {left_, mapPopover_, heightFilterPanel_, top_, editor_, h, s, o,
                            objectsCard_, processingCard_}) {
     auto *shadow = new QGraphicsDropShadowEffect(cardWidget);
@@ -2803,13 +2919,10 @@ void MissionController::refreshMapInfo() {
     window_->statusBar()->showMessage("地图坐标：" + frame_ + "　·　单位：m");
 }
 void MissionController::refreshRouteStrip() {
-  if (!routeStrip_ || !routeSummary_)
+  if (!routeStrip_)
     return;
   const int count = mission_.waypoints_size();
   const int selected = waypoints_ ? waypoints_->currentRow() : -1;
-  routeSummary_->setText(QString("%1 个航点 · %2")
-                             .arg(count)
-                             .arg(routeSyncedToOnboard_ ? "已同步任务机" : "本地编辑"));
   auto *strip = qobject_cast<QHBoxLayout *>(routeStrip_->layout());
   while (auto *item = strip->takeAt(0)) {
     if (auto *widget = item->widget()) {
@@ -2819,8 +2932,9 @@ void MissionController::refreshRouteStrip() {
     delete item;
   }
   if (count == 0) {
-    auto *empty = new QLabel("暂无航点 · 点击查看打开弹窗", routeStrip_);
+    auto *empty = new QLabel("暂无航点 · 双击打开航点任务", routeStrip_);
     empty->setObjectName("mutedText");
+    empty->setAttribute(Qt::WA_TransparentForMouseEvents);
     strip->addWidget(empty);
     strip->addStretch();
     return;
@@ -2828,8 +2942,11 @@ void MissionController::refreshRouteStrip() {
   constexpr int kVisible = 4;
   const int first = qBound(0, selected - 1, qMax(0, count - kVisible));
   const int last = qMin(count, first + kVisible);
-  if (first > 0)
-    strip->addWidget(new QLabel("…", routeStrip_));
+  if (first > 0) {
+    auto *ellipsis = new QLabel("…", routeStrip_);
+    ellipsis->setAttribute(Qt::WA_TransparentForMouseEvents);
+    strip->addWidget(ellipsis);
+  }
   for (int i = first; i < last; ++i) {
     auto *chip = new QPushButton(
         QString("%1%2").arg(routeSyncedToOnboard_ ? "机" : "本")
@@ -2837,35 +2954,33 @@ void MissionController::refreshRouteStrip() {
     chip->setObjectName("routeChip");
     chip->setCheckable(true);
     chip->setChecked(i == selected);
-    chip->setToolTip(QString("航点 %1 · 双击编辑；修改后需上传到任务机")
+    chip->setToolTip(QString("航点 %1 · 双击打开航点任务")
                          .arg(i + 1));
     chip->setProperty("routeIndex", i);
     chip->installEventFilter(this);
     strip->addWidget(chip);
     connect(chip, &QPushButton::clicked, this, [this, chip, i] {
-      // Wait for a possible second click before opening the route dialog.
-      // Opening it immediately would take focus away from the chip.
       const int generation = chip->property("routeClickGeneration").toInt() + 1;
       chip->setProperty("routeClickGeneration", generation);
       QTimer::singleShot(QApplication::doubleClickInterval(), chip,
                          [this, chip, i, generation] {
-        if (chip->property("routeClickGeneration").toInt() == generation) {
-          waypoints_->selectRow(i);
-          setEditorCollapsed(false);
-        }
+        if (chip->property("routeClickGeneration").toInt() != generation)
+          return;
+        chip->setChecked(true);
+        waypoints_->selectRow(i);
       });
     });
   }
-  if (last < count)
-    strip->addWidget(new QLabel(QString("… +%1").arg(count - last), routeStrip_));
+  if (last < count) {
+    auto *ellipsis = new QLabel(QString("… +%1").arg(count - last), routeStrip_);
+    ellipsis->setAttribute(Qt::WA_TransparentForMouseEvents);
+    strip->addWidget(ellipsis);
+  }
   strip->addStretch();
 }
 void MissionController::setEditorCollapsed(bool collapsed) {
   if (!editor_ || !routeDialog_ || !routeStrip_)
     return;
-  editorCollapsed_ = collapsed;
-  routeFold_->setText(collapsed ? "查看 ↗" : "关闭 ×");
-  routeFold_->setAccessibleName(collapsed ? "查看航点任务弹窗" : "关闭航点任务弹窗");
   if (collapsed) {
     routeDialog_->hide();
   } else {
@@ -3039,16 +3154,28 @@ bool MissionController::eventFilter(QObject *o, QEvent *e) {
       if (row >= waypoints_->rowCount())
         return;
       waypoints_->selectRow(row);
-      editWaypoint();
+      setEditorCollapsed(false);
     });
     return true;
   }
   if (e->type() == QEvent::MouseButtonDblClick) {
+    if ((o == editor_ || o == routeStrip_) &&
+        static_cast<QMouseEvent *>(e)->button() == Qt::LeftButton) {
+      setEditorCollapsed(false);
+      return true;
+    }
     if (chip && chip->objectName() == "routeChip" &&
         static_cast<QMouseEvent *>(e)->button() == Qt::LeftButton) {
       chip->setProperty("routeClickGeneration",
                         chip->property("routeClickGeneration").toInt() + 1);
       chip->setProperty("routeDoubleClickPending", true);
+      return true;
+    }
+  }
+  if (o == routeStrip_ && e->type() == QEvent::KeyPress) {
+    const int key = static_cast<QKeyEvent *>(e)->key();
+    if (key == Qt::Key_Return || key == Qt::Key_Enter || key == Qt::Key_Space) {
+      setEditorCollapsed(false);
       return true;
     }
   }
@@ -3068,8 +3195,6 @@ bool MissionController::eventFilter(QObject *o, QEvent *e) {
     QTimer::singleShot(0, this, [this] { updateWaypointGizmo(); });
   if (o == window_->menuBar() && e->type() == QEvent::Resize && latest_)
     QTimer::singleShot(0, this, &MissionController::placeLatestLogButton);
-  if (o == window_ && e->type() == QEvent::Resize && bagReplayToolbar_)
-    bagReplayToolbar_->setWindowWidth(window_->width());
   if (o == video_ || o == videoWidget_) {
     QMouseEvent *m = nullptr;
     if (e->type() == QEvent::MouseButtonPress ||
@@ -3430,24 +3555,34 @@ void MissionController::renderFlightReplay(const FlightReplayFrame &frame) {
     }
   }
   const QString angles = frame.hudPoseValid
-      ? QString("R%1° P%2° Y%3°")
+      ? QString("%1°  /  %2°  /  %3°")
             .arg(frame.rollDeg, 0, 'f', 0)
             .arg(frame.pitchDeg, 0, 'f', 0)
-            .arg(frame.yawDeg, 0, 'f', 0) : QStringLiteral("R— P— Y—");
+            .arg(frame.yawDeg, 0, 'f', 0) : QStringLiteral("— / — / —");
   const QString position = frame.hudPoseValid
       ? QString("%1 / %2 / %3 m")
             .arg(frame.hudPosition.x(), 0, 'f', 1)
             .arg(frame.hudPosition.y(), 0, 'f', 1)
-            .arg(frame.hudPosition.z(), 0, 'f', 1) : QStringLiteral("—");
-  hud_->setText(QString("历史回放\n解锁状态 %1\n飞行模式 %2\n%3\n速度 %4\nXYZ %5\n电量 %6")
-      .arg(frame.fcuStateValid ? (frame.armed ? "已解锁" : "未解锁") : "未知",
-           frame.fcuStateValid && !frame.flightMode.isEmpty() &&
-                   frame.flightMode != "UNKNOWN" ? frame.flightMode : "未知",
-           angles,
-           frame.hudVelocityValid ? QString::number(frame.speedMps, 'f', 1) + " m/s" : "—",
-           position,
-           frame.hudBatteryValid ? QString::number(frame.batteryPercent, 'f', 0) + "%" : "—"));
-  batteryBar_->setValue(frame.hudBatteryValid ? qBound(0, int(frame.batteryPercent), 100) : 0);
+            .arg(frame.hudPosition.z(), 0, 'f', 1)
+      : QStringLiteral("— / — / —");
+  attitude_->armed = frame.fcuStateValid
+                         ? (frame.armed ? "已解锁" : "未解锁") : "未知";
+  attitude_->flightMode = frame.fcuStateValid && !frame.flightMode.isEmpty() &&
+                                  frame.flightMode != "UNKNOWN"
+                              ? frame.flightMode : "未知";
+  attitude_->angles = angles;
+  attitude_->speed = frame.hudVelocityValid
+                         ? QString::number(frame.speedMps, 'f', 1) + " m/s" : "—";
+  attitude_->position = position;
+  attitude_->battery = frame.hudBatteryValid
+                           ? QString::number(frame.batteryPercent, 'f', 0) + "%"
+                           : "—";
+  attitude_->flightTime = frame.flightStatsValid
+                              ? flightTimeText(frame.flightSeconds) : "—";
+  attitude_->flightDistance = frame.flightStatsValid
+                                  ? flightDistanceText(frame.flightDistanceM) : "—";
+  attitude_->notice.clear();
+  attitude_->context = "历史回放";
   attitude_->valid = frame.hudPoseValid;
   attitude_->roll = frame.rollDeg;
   attitude_->pitch = frame.pitchDeg;

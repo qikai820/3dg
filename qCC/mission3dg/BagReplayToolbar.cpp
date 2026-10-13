@@ -1,16 +1,17 @@
 #include "BagReplayToolbar.h"
 
-#include <QComboBox>
+#include <QActionGroup>
 #include <QFont>
-#include <QFontMetrics>
+#include <QFontDatabase>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
+#include <QMenu>
 #include <QPainter>
-#include <QPushButton>
-#include <QResizeEvent>
+#include <QPixmap>
 #include <QSlider>
 #include <QTimer>
-#include <cmath>
+#include <QToolButton>
 
 namespace {
 QString replayTime(double seconds) {
@@ -24,157 +25,138 @@ QString replayTime(double seconds) {
                : QString("%1:%2")
                      .arg(total / 60).arg(remainder, 2, 10, QLatin1Char('0'));
 }
+
+QString replaySpeed(double speed) {
+  return QString("X%1").arg(speed, 0, 'g', 3);
+}
+
+enum class ReplayGlyph { Play, Pause, Stop };
+
+QPixmap glyphPixmap(ReplayGlyph glyph, const QColor &color) {
+  QPixmap pixmap(40, 40);
+  pixmap.fill(Qt::transparent);
+  pixmap.setDevicePixelRatio(2);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  painter.scale(2, 2);
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(color);
+  if (glyph == ReplayGlyph::Pause) {
+    painter.drawRoundedRect(QRectF(4, 4, 4, 12), 1, 1);
+    painter.drawRoundedRect(QRectF(12, 4, 4, 12), 1, 1);
+  } else if (glyph == ReplayGlyph::Stop) {
+    painter.drawRoundedRect(QRectF(5, 5, 10, 10), 1.5, 1.5);
+  } else {
+    const QPointF triangle[] = {{5, 3}, {5, 17}, {17, 10}};
+    painter.drawPolygon(triangle, 3);
+  }
+  return pixmap;
+}
+
+QIcon playbackIcon(ReplayGlyph glyph) {
+  QIcon icon;
+  icon.addPixmap(glyphPixmap(glyph, QColor(20, 111, 98)), QIcon::Normal);
+  icon.addPixmap(glyphPixmap(glyph, QColor(117, 161, 154)), QIcon::Disabled);
+  return icon;
+}
 } // namespace
-
-class ReplayTimeRuler : public QWidget {
-public:
-  explicit ReplayTimeRuler(QWidget *parent = nullptr) : QWidget(parent) {
-    setFixedHeight(14);
-    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-  }
-  void setDuration(double seconds) {
-    duration_ = seconds;
-    update();
-  }
-
-protected:
-  void paintEvent(QPaintEvent *) override {
-    if (duration_ <= 0)
-      return;
-    QPainter painter(this);
-    QFont font = painter.font();
-    font.setPixelSize(10);
-    painter.setFont(font);
-    painter.setPen(QColor(91, 112, 125));
-    const int left = 9;
-    const int span = qMax(0, width() - 18);
-    int divisions = 6;
-    if (width() < 150)
-      divisions = 1;
-    else if (width() < 360)
-      divisions = 2;
-    else if (width() < 620)
-      divisions = 4;
-    for (int i = 0; i <= divisions; ++i) {
-      const int x = left + qRound(double(span) * i / divisions);
-      painter.drawLine(x, 0, x, i % 2 == 0 ? 3 : 2);
-      const QString label = replayTime(duration_ * i / divisions);
-      const int labelX = i == 0 ? 0 : i == divisions ? width() - 64 : x - 32;
-      const QRect text(labelX, 2, 64, height() - 2);
-      painter.drawText(text, Qt::AlignHCenter | Qt::AlignBottom, label);
-    }
-  }
-
-private:
-  double duration_ = 0;
-};
-
-class ReplayTimeline : public QWidget {
-public:
-  explicit ReplayTimeline(QWidget *parent = nullptr) : QWidget(parent) {
-    setFixedHeight(40);
-    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-  }
-
-  void setControls(QSlider *seek, ReplayTimeRuler *ruler) {
-    seek_ = seek;
-    ruler_ = ruler;
-    positionControls();
-  }
-
-protected:
-  void resizeEvent(QResizeEvent *event) override {
-    QWidget::resizeEvent(event);
-    positionControls();
-  }
-
-private:
-  void positionControls() {
-    if (ruler_)
-      ruler_->setGeometry(0, 0, width(), 14);
-    if (seek_)
-      seek_->setGeometry(0, 8, width(), 24);
-  }
-
-  QSlider *seek_ = nullptr;
-  ReplayTimeRuler *ruler_ = nullptr;
-};
 
 BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
     : QFrame(parent), client_(client) {
   setObjectName("bagReplayToolbar");
   setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-  setFixedHeight(52);
+  setFixedHeight(38);
   auto *layout = new QHBoxLayout(this);
-  layout->setContentsMargins(12, 5, 12, 5);
-  layout->setSpacing(10);
+  layout->setContentsMargins(8, 3, 8, 3);
+  layout->setSpacing(6);
 
-  leftInfo_ = new QWidget(this);
-  leftInfo_->setFixedHeight(22);
-  auto *infoLayout = new QHBoxLayout(leftInfo_);
-  infoLayout->setContentsMargins(0, 0, 0, 0);
-  infoLayout->setSpacing(6);
-  status_ = new QLabel(leftInfo_);
-  status_->setFixedHeight(22);
-  status_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
-  infoLayout->addWidget(status_);
-  time_ = new QLabel("--:-- / --:--", leftInfo_);
-  time_->setFixedHeight(22);
-  time_->setStyleSheet("color:#587487;font-size:11px;");
-  infoLayout->addWidget(time_);
-  infoLayout->addStretch(1);
-  layout->addWidget(leftInfo_);
+  time_ = new QLabel("--:-- / --:--", this);
+  time_->setObjectName("replayTimeLabel");
+  time_->setFixedSize(138, 24);
+  time_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  QFont timeFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+  timeFont.setPixelSize(11);
+  timeFont.setWeight(QFont::DemiBold);
+  time_->setFont(timeFont);
 
-  auto *timeline = new ReplayTimeline(this);
-  seek_ = new QSlider(Qt::Horizontal, timeline);
-  seek_->setFixedHeight(24);
+  seek_ = new QSlider(Qt::Horizontal, this);
+  seek_->setFixedHeight(28);
   seek_->setRange(0, 10000);
   seek_->setAccessibleName("bag 回放时间轴");
   seek_->setToolTip("松开滑块后跳转；定位、点云和历史轨迹会重新开始");
   seek_->setStyleSheet(
-      "QSlider::groove:horizontal{height:12px;"
-      "background:rgba(220,233,237,110);"
-      "border:1px solid rgba(184,206,215,140);border-radius:6px;}"
-      "QSlider::sub-page:horizontal{background:rgba(101,203,189,150);"
-      "border-radius:6px;}"
-      "QSlider::handle:horizontal{width:13px;margin:0;"
-      "background:rgba(255,255,255,210);"
-      "border:1px solid rgba(129,158,170,200);border-radius:6px;}"
-      "QSlider:disabled::groove:horizontal{"
-      "background:rgba(233,239,241,110);}");
-  ruler_ = new ReplayTimeRuler(timeline);
-  timeline->setControls(seek_, ruler_);
-  layout->addWidget(timeline, 1, Qt::AlignBottom);
+      "QSlider{background:transparent;}"
+      "QSlider::groove:horizontal{height:6px;"
+      "background:#d7e7ec;"
+      "border:1px solid #c6dbe2;border-radius:3px;}"
+      "QSlider::sub-page:horizontal{background:#3ac4ad;"
+      "border-radius:3px;}"
+      "QSlider::add-page:horizontal{background:#d7e7ec;"
+      "border-radius:3px;}"
+      "QSlider::handle:horizontal{width:26px;margin:-10px 0;"
+      "background:#ffffff;border:2px solid #168778;border-radius:13px;}"
+      "QSlider::handle:horizontal:hover{background:#e6fbf6;"
+      "border-color:#0f7468;}"
+      "QSlider::handle:horizontal:pressed{background:#c8eee4;}");
+  layout->addWidget(seek_, 1);
 
   auto *buttons = new QHBoxLayout;
-  buttons->setSpacing(6);
-  pause_ = new QPushButton("暂停", this);
-  pause_->setObjectName("replayPauseButton");
-  stop_ = new QPushButton("停止回放", this);
-  stop_->setObjectName("replayStopButton");
-  for (QPushButton *button : {pause_, stop_}) {
-    button->setFixedHeight(28);
-    button->setCursor(Qt::PointingHandCursor);
-  }
-  speed_ = new QComboBox(this);
-  speed_->setObjectName("replaySpeedCombo");
-  speed_->setFixedHeight(28);
-  for (double speed : {.25, .5, 1.0, 2.0, 4.0})
-    speed_->addItem(QString("%1 倍").arg(speed, 0, 'g', 3), speed);
-  speed_->setCurrentIndex(2);
-  buttons->addWidget(pause_);
-  buttons->addWidget(stop_);
-  buttons->addWidget(speed_);
-  layout->addLayout(buttons);
-  updateStatusText();
-
-  connect(pause_, &QPushButton::clicked, this, [this] {
-    sendReplay(replay_.state() == mission::ReplayStatus::PAUSED
-                   ? mission::Command::REPLAY_RESUME
-                   : mission::Command::REPLAY_PAUSE);
-  });
-  connect(stop_, &QPushButton::clicked, this,
+  buttons->setSpacing(2);
+  playback_ = new QToolButton(this);
+  playback_->setObjectName("replayPlaybackButton");
+  playback_->setIconSize(QSize(18, 18));
+  playback_->setFixedWidth(50);
+  playback_->setFixedHeight(28);
+  playback_->setCursor(Qt::PointingHandCursor);
+  playback_->setPopupMode(QToolButton::MenuButtonPopup);
+  playback_->setToolButtonStyle(Qt::ToolButtonIconOnly);
+  auto *playbackMenu = new QMenu(playback_);
+  auto *stopAction = playbackMenu->addAction(
+      QIcon(glyphPixmap(ReplayGlyph::Stop, QColor(164, 84, 60))),
+      "停止回放");
+  playback_->setMenu(playbackMenu);
+  connect(stopAction, &QAction::triggered, this,
           [this] { sendReplay(mission::Command::REPLAY_STOP); });
+  speed_ = new QToolButton(this);
+  speed_->setObjectName("replaySpeedButton");
+  speed_->setText(replaySpeed(selectedSpeed_));
+  speed_->setFixedSize(44, 28);
+  speed_->setCursor(Qt::PointingHandCursor);
+  speed_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+  speed_->setAccessibleName("回放倍率 " + replaySpeed(selectedSpeed_));
+  speedMenu_ = new QMenu(speed_);
+  auto *speedGroup = new QActionGroup(speedMenu_);
+  speedGroup->setExclusive(true);
+  for (double speed : {.25, .5, 1.0, 2.0, 4.0}) {
+    auto *action = speedMenu_->addAction(replaySpeed(speed));
+    action->setData(speed);
+    action->setCheckable(true);
+    action->setActionGroup(speedGroup);
+    action->setChecked(speed == selectedSpeed_);
+    connect(action, &QAction::triggered, this, [this, speed] {
+      selectedSpeed_ = speed;
+      speed_->setText(replaySpeed(speed));
+      speed_->setToolTip("播放倍率：" + replaySpeed(speed));
+      speed_->setAccessibleName("回放倍率 " + replaySpeed(speed));
+      sendReplay(mission::Command::REPLAY_SPEED);
+    });
+  }
+  speed_->setToolTip("播放倍率：" + replaySpeed(selectedSpeed_));
+  connect(speed_, &QToolButton::clicked, this, [this] {
+    speedMenu_->popup(speed_->mapToGlobal(QPoint(0, speed_->height())));
+  });
+  buttons->addWidget(playback_);
+  buttons->addWidget(speed_);
+  layout->insertLayout(0, buttons);
+  layout->addWidget(time_);
+  connect(playback_, &QToolButton::clicked, this, [this] {
+    const auto state = replay_.state();
+    sendReplay(state == mission::ReplayStatus::PAUSED
+                   ? mission::Command::REPLAY_RESUME
+               : state == mission::ReplayStatus::PLAYING
+                   ? mission::Command::REPLAY_PAUSE
+                   : mission::Command::REPLAY_STOP);
+  });
   connect(seek_, &QSlider::sliderReleased, this, [this] {
     sendReplay(mission::Command::REPLAY_SEEK,
                replay_.duration_seconds() * seek_->value() / 10000.0);
@@ -183,8 +165,6 @@ BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
     time_->setText(replayTime(replay_.duration_seconds() * value / 10000.0) +
                    " / " + replayTime(replay_.duration_seconds()));
   });
-  connect(speed_, QOverload<int>::of(&QComboBox::activated), this,
-          [this](int) { sendReplay(mission::Command::REPLAY_SPEED); });
   if (client_) {
     connect(client_, &ProtocolClient::message, this,
             [this](const mission::Envelope &envelope) {
@@ -198,7 +178,7 @@ BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
                 pendingRequest_.clear();
                 refreshControls();
                 if (envelope.result().state() == mission::CommandResult::FAILED)
-                  status_->setToolTip(
+                  time_->setToolTip(
                       QString::fromStdString(envelope.result().detail()));
               }
             });
@@ -211,28 +191,14 @@ BagReplayToolbar::BagReplayToolbar(ProtocolClient *client, QWidget *parent)
                 client_->sendCommand(command);
               } else if (!ready) {
                 replay_.Clear();
-                fullStatus_ = QStringLiteral("bag 回放：任务机未连接");
-                updateStatusText();
-                status_->setToolTip(fullStatus_);
                 time_->setText("--:-- / --:--");
+                time_->setToolTip(QString());
                 seek_->setValue(0);
-                ruler_->setDuration(0);
               }
               refreshControls();
             });
   }
   refreshControls();
-}
-
-void BagReplayToolbar::setWindowWidth(int width) {
-  leftInfo_->setFixedWidth(qMin(width / 3, 440));
-  updateStatusText();
-}
-
-void BagReplayToolbar::updateStatusText() {
-  const int available = leftInfo_->width() - 6 - time_->sizeHint().width();
-  status_->setText(status_->fontMetrics().elidedText(
-      fullStatus_, Qt::ElideMiddle, qMax(0, available)));
 }
 
 void BagReplayToolbar::setReplayStatus(const mission::ReplayStatus &status) {
@@ -245,26 +211,30 @@ void BagReplayToolbar::setReplayStatus(const mission::ReplayStatus &status) {
                         : replay_.state() == mission::ReplayStatus::ENDED
                             ? QStringLiteral("已结束")
                             : QStringLiteral("出错");
-  fullStatus_ = active
-                    ? QString("bag 回放：%1 · %2")
-                          .arg(QString::fromStdString(replay_.bag_id()), state)
-                    : QStringLiteral("bag 回放：实时数据");
-  status_->setToolTip(fullStatus_ + "\n" +
-                      QString::fromStdString(replay_.detail()));
+  time_->setToolTip(active ? QString("%1 · %2\n%3")
+                                  .arg(QString::fromStdString(replay_.bag_id()),
+                                       state,
+                                       QString::fromStdString(replay_.detail()))
+                            : QString());
   time_->setText(active ? QString("%1 / %2")
                               .arg(replayTime(replay_.position_seconds()),
                                    replayTime(replay_.duration_seconds()))
                         : QStringLiteral("--:-- / --:--"));
-  updateStatusText();
-  ruler_->setDuration(active ? replay_.duration_seconds() : 0);
   if (!seek_->isSliderDown())
     seek_->setValue(active && replay_.duration_seconds() > 0
                         ? qBound(0, int(replay_.position_seconds() /
                                             replay_.duration_seconds() * 10000), 10000)
                         : 0);
-  const int speedIndex = speed_->findData(replay_.speed());
-  if (speedIndex >= 0)
-    speed_->setCurrentIndex(speedIndex);
+  for (QAction *action : speedMenu_->actions()) {
+    if (action->data().toDouble() == replay_.speed()) {
+      selectedSpeed_ = replay_.speed();
+      action->setChecked(true);
+      speed_->setText(replaySpeed(selectedSpeed_));
+      speed_->setToolTip("播放倍率：" + replaySpeed(selectedSpeed_));
+      speed_->setAccessibleName("回放倍率 " + replaySpeed(selectedSpeed_));
+      break;
+    }
+  }
   refreshControls();
 }
 
@@ -273,11 +243,26 @@ void BagReplayToolbar::refreshControls() {
                          client_->bagReplaySupported();
   const bool idle = pendingRequest_.isEmpty();
   const auto state = replay_.state();
-  pause_->setText(state == mission::ReplayStatus::PAUSED ? "继续" : "暂停");
-  pause_->setEnabled(connected && idle &&
-                     (state == mission::ReplayStatus::PLAYING ||
-                      state == mission::ReplayStatus::PAUSED));
-  stop_->setEnabled(connected && idle && state != mission::ReplayStatus::LIVE);
+  const auto glyph = state == mission::ReplayStatus::PLAYING
+                         ? ReplayGlyph::Pause
+                     : state == mission::ReplayStatus::ENDED ||
+                               state == mission::ReplayStatus::ERROR
+                         ? ReplayGlyph::Stop
+                         : ReplayGlyph::Play;
+  playback_->setIcon(playbackIcon(glyph));
+  playback_->setAccessibleName(state == mission::ReplayStatus::PLAYING ? "暂停回放" :
+                               state == mission::ReplayStatus::PAUSED ? "继续回放" :
+                               state == mission::ReplayStatus::LIVE ? "播放" :
+                               "停止回放");
+  playback_->setEnabled(connected && idle && state != mission::ReplayStatus::LIVE);
+  playback_->setToolTip(!connected
+                            ? "连接任务机后可回放 bag"
+                        : state == mission::ReplayStatus::LIVE
+                            ? "请先从数据管理选择已完成的 bag"
+                        : state == mission::ReplayStatus::PLAYING ||
+                                  state == mission::ReplayStatus::PAUSED
+                            ? "点击暂停或继续；点右侧箭头可停止回放"
+                            : "停止回放并恢复实时数据");
   speed_->setEnabled(connected && idle &&
                       (state == mission::ReplayStatus::PLAYING ||
                        state == mission::ReplayStatus::PAUSED));
@@ -295,7 +280,7 @@ void BagReplayToolbar::sendReplay(mission::Command::Kind kind, double seconds) {
   if (kind == mission::Command::REPLAY_SEEK)
     command.set_replay_seconds(seconds);
   else if (kind == mission::Command::REPLAY_SPEED)
-    command.set_replay_speed(speed_->currentData().toDouble());
+    command.set_replay_speed(selectedSpeed_);
   pendingRequest_ = client_->sendCommand(command);
   refreshControls();
   if (!pendingRequest_.isEmpty()) {
@@ -303,7 +288,7 @@ void BagReplayToolbar::sendReplay(mission::Command::Kind kind, double seconds) {
     QTimer::singleShot(30000, this, [this, request] {
       if (pendingRequest_ == request) {
         pendingRequest_.clear();
-        status_->setToolTip("回放命令等待超时；请查看任务机日志");
+        time_->setToolTip("回放命令等待超时；请查看任务机日志");
         refreshControls();
       }
     });

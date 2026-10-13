@@ -38,6 +38,8 @@ struct FlightReplayFrame {
   QVector3D hudPosition;
   double rollDeg = 0, pitchDeg = 0, yawDeg = 0;
   double speedMps = 0, batteryPercent = 0;
+  bool flightStatsValid = false;
+  double flightSeconds = 0, flightDistanceM = 0;
 };
 
 // Reads the existing task-machine flight-record API; it never sends commands.
